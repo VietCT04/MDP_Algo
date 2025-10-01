@@ -1,0 +1,19 @@
+{
+  "meta": {
+    "arena_size": 200,
+    "obstacle_size": 10,
+    "timestamp": "2025-09-29T23:55:41"
+  },
+  "obstacles": [
+    {
+      "x": 50.0,
+      "y": 150.0,
+      "side": "S"
+    },
+    {
+      "x": 150.0,
+      "y": 50.0,
+      "side": "W"
+    }
+  ]
+}

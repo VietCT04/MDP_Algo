@@ -1,0 +1,1937 @@
+This file is a merged representation of the entire codebase, combined into a single document by Repomix.
+
+<file_summary>
+This section contains a summary of this file.
+
+<purpose>
+This file contains a packed representation of the entire repository's contents.
+It is designed to be easily consumable by AI systems for analysis, code review,
+or other automated processes.
+</purpose>
+
+<file_format>
+The content is organized as follows:
+1. This summary section
+2. Repository information
+3. Directory structure
+4. Repository files (if enabled)
+5. Multiple file entries, each consisting of:
+  - File path as an attribute
+  - Full contents of the file
+</file_format>
+
+<usage_guidelines>
+- This file should be treated as read-only. Any changes should be made to the
+  original repository files, not this packed version.
+- When processing this file, use the file path to distinguish
+  between different files in the repository.
+- Be aware that this file may contain sensitive information. Handle it with
+  the same level of security as you would the original repository.
+</usage_guidelines>
+
+<notes>
+- Some files may have been excluded based on .gitignore rules and Repomix's configuration
+- Binary files are not included in this packed representation. Please refer to the Repository Structure section for a complete list of file paths, including binary files
+- Files matching patterns in .gitignore are excluded
+- Files matching default ignore patterns are excluded
+- Files are sorted by Git change count (files with more changes are at the bottom)
+</notes>
+
+</file_summary>
+
+<directory_structure>
+algo/
+  lib/
+    car.py
+    controller.py
+    path.py
+    pathfinding.py
+  server/
+    server.py
+  config.py
+  sim.py
+.gitignore
+README.md
+</directory_structure>
+
+<files>
+This section contains the contents of the repository's files.
+
+<file path="algo/lib/car.py">
+import math
+from enum import Enum
+from dataclasses import dataclass
+
+class CarAction(Enum):
+    """Actions the car can perform."""
+    FORWARD = "forward"
+    BACKWARD = "backward"
+    TURN_LEFT = "turn_left"
+    TURN_RIGHT = "turn_right"
+    STOP = "stop"
+
+
+@dataclass
+class CarState:
+    x: float  # cm from bottom-left corner
+    y: float  # cm from bottom-left corner
+    theta: float  # orientation in radians (0 = facing east)
+
+    def distance_to(self, other: 'CarState') -> float:
+        return math.sqrt((self.x - other.x) ** 2 + (self.y - other.y) ** 2)
+
+    def angle_to(self, other: 'CarState') -> float:
+        return math.atan2(other.y - self.y, other.x - self.x)
+
+
+@dataclass
+class CarCommand:
+    action: CarAction
+    parameters: dict
+    expected_end_state: CarState
+
+def normalize_angle(angle: float) -> float:
+    """Normalize angle to [-π, π] range."""
+    while angle > math.pi:
+        angle -= 2 * math.pi
+    while angle < -math.pi:
+        angle += 2 * math.pi
+    return angle
+
+
+def angle_difference(angle1: float, angle2: float) -> float:
+    """Shortest angular difference between two angles."""
+    diff = angle2 - angle1
+    return normalize_angle(diff)
+</file>
+
+<file path="algo/lib/controller.py">
+"""
+Fixed Dubins-aware controller that follows curve geometry without bugs.
+(Updated: CarMissionManager now prefers shortest-time Hamiltonian planning.)
+"""
+
+import math
+from typing import List, Optional, Dict, Any, Tuple
+from dataclasses import dataclass
+from enum import Enum
+
+from lib.car import CarState, CarAction, CarCommand, normalize_angle, angle_difference
+from config import config
+from lib.path import DubinsPath, DubinsPathType
+from lib.pathfinding import CarPathPlanner
+
+class DubinsSegmentType(Enum):
+    LEFT_TURN = "L"
+    RIGHT_TURN = "R"
+    STRAIGHT = "S"
+
+@dataclass
+class DubinsSegmentInfo:
+    segment_type: 'DubinsSegmentType'
+    segment_index: int
+    start_point: Tuple[float, float]
+    end_point: Tuple[float, float]
+    start_heading: float
+    end_heading: float
+    center_point: Optional[Tuple[float, float]] = None
+
+@dataclass
+class CarStatus:
+    estimated_state: CarState
+    confidence_radius: float
+    last_command: Optional[CarCommand] = None
+    commands_executed: int = 0
+
+
+class DubinsAwareController:
+    """Controller that follows Dubins path geometry with proper arc movement."""
+
+    def __init__(self):
+        self.waypoint_tolerance = config.pathfinding.waypoint_tolerance
+        self.angle_tolerance = config.pathfinding.angle_tolerance
+        self.max_forward_step = config.pathfinding.max_forward_step
+        self.turning_radius = config.car.turning_radius
+
+        self.current_path: Optional[List[DubinsPath]] = None
+        self.path_index: int = 0
+        self.current_segment: Optional[DubinsSegmentInfo] = None
+        self.image_recognition_time: int = 0
+        self.at_target: bool = False
+
+    def set_path(self, path_segments: List[DubinsPath]):
+        self.current_path = path_segments
+        self.path_index = 0
+        self.current_segment = None
+        self.image_recognition_time = 0
+        self.at_target = False
+
+        print(f"Controller: Set path with {len(path_segments)} segments")
+        for i, segment in enumerate(path_segments):
+            label = segment.path_type.value.upper() if hasattr(segment.path_type, "value") else str(segment.path_type)
+            print(f"  Path {i}: {label} ({segment.length:.1f}cm)")
+
+    def get_next_command(self, car_status: CarStatus) -> Optional[CarCommand]:
+        if not self.current_path:
+            return CarCommand(CarAction.STOP, {"reason": "no_path"}, car_status.estimated_state)
+        if self.path_index >= len(self.current_path):
+            return CarCommand(CarAction.STOP, {"reason": "path_complete"}, car_status.estimated_state)
+
+        cur_path = self.current_path[self.path_index]
+        current_state = car_status.estimated_state
+
+        # Initialize first segment of current Dubins path
+        if self.current_segment is None:
+            self.current_segment = self._initialize_first_segment(cur_path)
+            if self.current_segment is None:
+                self.path_index += 1
+                return self.get_next_command(car_status)
+
+        # If we've reached end of this Dubins path, do image recognition pause
+        if self._is_at_dubins_path_end(current_state, cur_path):
+            if not self.at_target:
+                self.at_target = True
+                self.image_recognition_time = 20
+            if self.image_recognition_time > 0:
+                self.image_recognition_time -= 1
+                return CarCommand(CarAction.STOP, {"reason": "image_recognition", "frames_remaining": self.image_recognition_time}, current_state)
+            # move on
+            self.path_index += 1
+            self.current_segment = None
+            self.at_target = False
+            return self.get_next_command(car_status)
+
+        # Segment transition
+        if self._is_current_segment_complete(current_state):
+            next_seg = self._get_next_segment(cur_path)
+            if next_seg is not None:
+                self.current_segment = next_seg
+
+        return self._generate_dubins_command(current_state)
+
+    # ---- segment helpers (same as your working version) ----
+    def _initialize_first_segment(self, dubins_path: DubinsPath) -> Optional[DubinsSegmentInfo]:
+        path_type = dubins_path.path_type.value.lower()
+        waypoints = dubins_path.waypoints
+        if len(waypoints) < 2 or len(path_type) < 1:
+            return None
+        segment_char = path_type[0].upper()
+        segment_type = DubinsSegmentType(segment_char)
+        start_point = waypoints[0]
+        end_point = waypoints[1]
+        start_heading = dubins_path.start_state.theta
+
+        if segment_type == DubinsSegmentType.STRAIGHT:
+            end_heading = math.atan2(end_point[1] - start_point[1], end_point[0] - start_point[0])
+        else:
+            center = self._calculate_turn_center(start_point, start_heading, segment_type)
+            end_heading = self._calculate_heading_at_point(end_point, center, segment_type)
+
+        seg = DubinsSegmentInfo(segment_type, 0, start_point, end_point, start_heading, end_heading)
+        if segment_type != DubinsSegmentType.STRAIGHT:
+            seg.center_point = self._calculate_turn_center(start_point, start_heading, segment_type)
+        return seg
+
+    def _calculate_turn_center(self, point: Tuple[float, float], heading: float, turn_type: DubinsSegmentType) -> Tuple[float, float]:
+        x, y = point
+        r = self.turning_radius
+        if turn_type == DubinsSegmentType.LEFT_TURN:
+            return (x - r * math.sin(heading), y + r * math.cos(heading))
+        else:
+            return (x + r * math.sin(heading), y - r * math.cos(heading))
+
+    def _calculate_heading_at_point(self, point: Tuple[float, float], center: Tuple[float, float], turn_type: DubinsSegmentType) -> float:
+        px, py = point
+        cx, cy = center
+        dx, dy = px - cx, py - cy
+        if turn_type == DubinsSegmentType.LEFT_TURN:
+            heading = math.atan2(dx, -dy)
+        else:
+            heading = math.atan2(-dx, dy)
+        return normalize_angle(heading)
+
+    def _is_current_segment_complete(self, current_state: CarState) -> bool:
+        if not self.current_segment:
+            return True
+        end_x, end_y = self.current_segment.end_point
+        distance = math.hypot(current_state.x - end_x, current_state.y - end_y)
+        if self.current_segment.segment_type != DubinsSegmentType.STRAIGHT:
+            angle_diff = abs(angle_difference(current_state.theta, self.current_segment.end_heading))
+            return distance <= self.waypoint_tolerance and angle_diff <= self.angle_tolerance
+        return distance <= self.waypoint_tolerance
+
+    def _is_at_dubins_path_end(self, current_state: CarState, dubins_path: DubinsPath) -> bool:
+        end_state = dubins_path.end_state
+        distance = math.hypot(current_state.x - end_state.x, current_state.y - end_state.y)
+        angle_diff_v = abs(angle_difference(current_state.theta, end_state.theta))
+        return distance <= (self.waypoint_tolerance * 2) and angle_diff_v <= (self.angle_tolerance * 3)
+
+    def _get_next_segment(self, dubins_path: DubinsPath) -> Optional[DubinsSegmentInfo]:
+        if not self.current_segment or self.current_segment.segment_index >= 2:
+            return None
+        path_type = dubins_path.path_type.value.lower()
+        next_index = self.current_segment.segment_index + 1
+        waypoints = dubins_path.waypoints
+        if next_index >= len(path_type) or next_index + 1 >= len(waypoints):
+            return None
+        segment_char = path_type[next_index].upper()
+        segment_type = DubinsSegmentType(segment_char)
+        start_point = waypoints[next_index]
+        end_point = waypoints[next_index + 1]
+        start_heading = self.current_segment.end_heading
+        if segment_type == DubinsSegmentType.STRAIGHT:
+            end_heading = math.atan2(end_point[1] - start_point[1], end_point[0] - start_point[0])
+        else:
+            center = self._calculate_turn_center(start_point, start_heading, segment_type)
+            end_heading = self._calculate_heading_at_point(end_point, center, segment_type)
+        seg = DubinsSegmentInfo(segment_type, next_index, start_point, end_point, start_heading, end_heading)
+        if segment_type != DubinsSegmentType.STRAIGHT:
+            seg.center_point = self._calculate_turn_center(start_point, start_heading, segment_type)
+        return seg
+
+    def _generate_dubins_command(self, current_state: CarState) -> CarCommand:
+        if not self.current_segment:
+            return CarCommand(CarAction.STOP, {"reason": "no_segment"}, current_state)
+        if self.current_segment.segment_type == DubinsSegmentType.STRAIGHT:
+            return self._cmd_straight(current_state)
+        return self._cmd_arc(current_state)
+
+    def _cmd_straight(self, current_state: CarState) -> CarCommand:
+        end_x, end_y = self.current_segment.end_point
+        target_heading = math.atan2(end_y - current_state.y, end_x - current_state.x)
+        heading_error = angle_difference(current_state.theta, target_heading)
+
+        if abs(heading_error) > self.angle_tolerance * 2:
+            turn_amount = min(abs(heading_error), 0.2)
+            if heading_error > 0:
+                new_theta = normalize_angle(current_state.theta + turn_amount)
+                return CarCommand(CarAction.TURN_LEFT, {"angle": turn_amount}, CarState(current_state.x, current_state.y, new_theta))
+            else:
+                new_theta = normalize_angle(current_state.theta - turn_amount)
+                return CarCommand(CarAction.TURN_RIGHT, {"angle": turn_amount}, CarState(current_state.x, current_state.y, new_theta))
+
+        distance_to_end = math.hypot(end_x - current_state.x, end_y - current_state.y)
+        move_distance = min(distance_to_end, self.max_forward_step * 1.5)
+        expected_x = current_state.x + move_distance * math.cos(current_state.theta)
+        expected_y = current_state.y + move_distance * math.sin(current_state.theta)
+        return CarCommand(CarAction.FORWARD, {"distance": move_distance}, CarState(expected_x, expected_y, current_state.theta))
+
+    def _cmd_arc(self, current_state: CarState) -> CarCommand:
+        cx, cy = self.current_segment.center_point
+        cur_ang = math.atan2(current_state.y - cy, current_state.x - cx)
+        angular_step = self.max_forward_step / self.turning_radius
+        direction = +1 if self.current_segment.segment_type == DubinsSegmentType.LEFT_TURN else -1
+        target_angle = cur_ang + direction * angular_step
+        new_x = cx + self.turning_radius * math.cos(target_angle)
+        new_y = cy + self.turning_radius * math.sin(target_angle)
+        if self.current_segment.segment_type == DubinsSegmentType.LEFT_TURN:
+            new_theta = normalize_angle(target_angle + math.pi / 2)
+            action = CarAction.TURN_LEFT
+        else:
+            new_theta = normalize_angle(target_angle - math.pi / 2)
+            action = CarAction.TURN_RIGHT
+        turn_angle = abs(angle_difference(current_state.theta, new_theta))
+        return CarCommand(action, {"angle": turn_angle, "arc_movement": True}, CarState(new_x, new_y, new_theta))
+
+    # ---- public status/update ----
+    def update_car_position(self, car_status: CarStatus, executed_command: CarCommand, actual_result: Dict[str, Any] = None) -> CarStatus:
+        if actual_result and 'measured_position' in actual_result:
+            measured_pos = actual_result['measured_position']
+            new_state = CarState(measured_pos['x'], measured_pos['y'], measured_pos['theta'])
+            new_confidence = config.car.position_drift
+        else:
+            new_state = executed_command.expected_end_state
+            new_confidence = car_status.confidence_radius + config.car.position_drift
+        return CarStatus(new_state, new_confidence, executed_command, car_status.commands_executed + 1)
+
+    def get_path_progress(self) -> Dict[str, Any]:
+        if not self.current_path:
+            return {"status": "no_path"}
+        total = len(self.current_path)
+        cur_idx = self.path_index
+        dubins_progress = 0.0
+        if self.current_segment and cur_idx < total:
+            dubins_progress = (self.current_segment.segment_index + 1) / 3.0
+        overall = (cur_idx + dubins_progress) / max(1, total)
+        return {
+            "status": "active" if cur_idx < total else "complete",
+            "total_segments": total,
+            "current_segment": cur_idx,
+            "dubins_segment_index": self.current_segment.segment_index if self.current_segment else -1,
+            "dubins_segment_type": self.current_segment.segment_type.value if self.current_segment else "None",
+            "overall_progress": overall,
+            "at_target": self.at_target,
+            "image_recognition_time": self.image_recognition_time
+        }
+
+
+class CarMissionManager:
+    """Mission manager using the Dubins-aware controller."""
+
+    def __init__(self):
+        self.path_planner = CarPathPlanner()
+        self.controller = DubinsAwareController()
+        self.car_status: Optional[CarStatus] = None
+        self.mission_targets: List[int] = []
+        self.visited_targets: List[int] = []
+
+    def initialize_car(self, x: float, y: float, theta: float = 0.0):
+        self.car_status = CarStatus(CarState(x, y, theta), 1.0)
+
+    def add_obstacle(self, x: int, y: int, image_side: str) -> int:
+        self.path_planner.add_obstacle(x, y, image_side)
+        return len(self.path_planner.obstacles) - 1
+
+    def plan_mission(self, target_obstacle_indices: List[int]) -> bool:
+        if not self.car_status:
+            return False
+
+        print(f"Planning mission to visit obstacles: {target_obstacle_indices}")
+
+        # Prefer exact shortest-time Hamiltonian (B.3)
+        segments = self.path_planner.plan_visiting_path(
+            self.car_status.estimated_state, target_obstacle_indices
+        )
+        if not segments:
+            print("Mission planning failed - no valid path found")
+            return False
+
+        self.controller.set_path(segments)
+        self.mission_targets = target_obstacle_indices.copy()
+        self.visited_targets = []
+        print(f"Mission planned: {len(segments)} segments to visit {len(target_obstacle_indices)} targets")
+        return True
+
+    def get_next_action(self) -> Optional[CarCommand]:
+        if not self.car_status:
+            return None
+        return self.controller.get_next_command(self.car_status)
+
+    def execute_command(self, command: CarCommand, actual_result: Dict[str, Any] = None) -> Dict[str, Any]:
+        if not self.car_status:
+            return {"status": "error", "message": "Car not initialized"}
+
+        self.car_status = self.controller.update_car_position(self.car_status, command, actual_result)
+
+        progress = self.controller.get_path_progress()
+        current_segment = progress.get("current_segment", 0)
+        if (current_segment > len(self.visited_targets) and
+                len(self.visited_targets) < len(self.mission_targets)):
+            target_idx = len(self.visited_targets)
+            self.visited_targets.append(self.mission_targets[target_idx])
+
+        return {
+            "status": "success",
+            "command_executed": command.action.value,
+            "estimated_position": {
+                "x": self.car_status.estimated_state.x,
+                "y": self.car_status.estimated_state.y,
+                "theta": self.car_status.estimated_state.theta
+            },
+            "position_confidence_radius": self.car_status.confidence_radius,
+            "progress": progress
+        }
+
+    def get_status(self) -> Dict[str, Any]:
+        if not self.car_status:
+            return {"status": "not_initialized"}
+        progress = self.controller.get_path_progress()
+        return {
+            "car_status": {
+                "position": {
+                    "x": self.car_status.estimated_state.x,
+                    "y": self.car_status.estimated_state.y,
+                    "theta": self.car_status.estimated_state.theta,
+                    "theta_degrees": math.degrees(self.car_status.estimated_state.theta)
+                },
+                "confidence_radius": self.car_status.confidence_radius,
+                "commands_executed": self.car_status.commands_executed
+            },
+            "mission": {
+                "targets": self.mission_targets,
+                "visited": self.visited_targets,
+                "progress": progress
+            },
+            "obstacles_count": len(self.path_planner.obstacles)
+        }
+</file>
+
+<file path="algo/lib/path.py">
+from typing import List, Tuple, Optional, Dict, Any
+from enum import Enum
+from dataclasses import dataclass, field
+
+from lib.car import CarState
+
+
+class DubinsPathType(Enum):
+    """Types of Dubins paths for car-like motion."""
+    RSR = "rsr"  # Right-Straight-Right
+    RSL = "rsl"  # Right-Straight-Left
+    LSR = "lsr"  # Left-Straight-Right
+    LSL = "lsl"  # Left-Straight-Left
+    RLR = "rlr"  # Right-Left-Right
+    LRL = "lrl"  # Left-Right-Left
+
+
+@dataclass
+class Obstacle:
+    """Obstacle in the arena with an image on one side."""
+    x: int  # bottom-left corner x coordinate (cm)
+    y: int  # bottom-left corner y coordinate (cm)
+    image_side: str  # 'E', 'N', 'W', 'S' - which side has the image
+
+
+@dataclass
+class DubinsPath:
+    """
+    A Dubins path between two car configurations.
+
+    NOTE: We extend the basic structure with:
+      - segment_types: ['L'|'R'|'S', 'L'|'R'|'S', 'L'|'R'|'S']
+      - segment_lengths: [arc1_cm, straight_cm, arc2_cm]  (straight_cm may be 0 for RLR/LRL)
+      - metadata: e.g., {"reverse_on_straight": True}
+    """
+    path_type: DubinsPathType
+    length: float  # total path length in cm
+    start_state: CarState
+    end_state: CarState
+    waypoints: List[Tuple[float, float]]  # sequence of (x,y) points: [start, t1, t2, end]
+    turn_points: List[Tuple[float, float]]  # [t1, t2]
+    segment_types: List[str] = field(default_factory=list)
+    segment_lengths: List[float] = field(default_factory=list)
+    metadata: Dict[str, Any] = field(default_factory=dict)
+</file>
+
+<file path="algo/lib/pathfinding.py">
+"""
+Enhanced pathfinding with multiple algorithms for robot car navigation.
+Now includes a shortest-time Hamiltonian (TSP) solver using Dubins time as edge cost.
+"""
+
+import math
+import numpy as np
+from typing import List, Tuple, Optional, Dict
+from itertools import permutations, combinations
+from dataclasses import dataclass
+
+from lib.car import CarState
+from lib.path import Obstacle, DubinsPath, DubinsPathType
+from config import config
+
+
+@dataclass
+class PathfindingResult:
+    """Result of pathfinding with debug info."""
+    paths: List[DubinsPath]
+    total_length: float
+    algorithm_used: str
+    debug_info: Dict
+
+
+# ------------ Dubins planner (unchanged geometry) -----------------
+class DubinsPlanner:
+    """Plans Dubins paths for car-like robot motion."""
+
+    def __init__(self, turning_radius: float = None):
+        self.turning_radius = turning_radius or config.car.turning_radius
+
+    def plan_path(self, start: CarState, goal: CarState) -> Optional[DubinsPath]:
+        """Plan shortest Dubins path between two car states. Returns None if no valid path exists."""
+        best_path = None
+        min_length = float('inf')
+        for path_type in DubinsPathType:
+            try:
+                path = self._compute_path(start, goal, path_type)
+                if path and path.length > 0 and path.length < min_length:
+                    min_length = path.length
+                    best_path = path
+            except Exception:
+                continue
+        return best_path
+
+    def _compute_path(self, start: CarState, goal: CarState, path_type: DubinsPathType) -> Optional[DubinsPath]:
+        r = self.turning_radius
+        if path_type == DubinsPathType.RSR:
+            return self._rsr_path(start, goal, r)
+        elif path_type == DubinsPathType.RSL:
+            return self._rsl_path(start, goal, r)
+        elif path_type == DubinsPathType.LSR:
+            return self._lsr_path(start, goal, r)
+        elif path_type == DubinsPathType.LSL:
+            return self._lsl_path(start, goal, r)
+        elif path_type == DubinsPathType.RLR:
+            return self._rlr_path(start, goal, r)
+        else:
+            return self._lrl_path(start, goal, r)
+
+    # ---- individual families (same as your working version) ----
+    def _rsr_path(self, start: CarState, goal: CarState, r: float) -> Optional[DubinsPath]:
+        c1x = start.x + r * math.sin(start.theta)
+        c1y = start.y - r * math.cos(start.theta)
+        c2x = goal.x + r * math.sin(goal.theta)
+        c2y = goal.y - r * math.cos(goal.theta)
+        dx, dy = c2x - c1x, c2y - c1y
+        d = math.hypot(dx, dy)
+        if d < 1e-3:
+            return None
+        ux, uy = -dy / d, dx / d  # external tangent
+        t1x, t1y = c1x + r * ux, c1y + r * uy
+        t2x, t2y = c2x + r * ux, c2y + r * uy
+        alpha = self._arc_angle(start.x, start.y, c1x, c1y, t1x, t1y, True)
+        beta = self._arc_angle(t2x, t2y, c2x, c2y, goal.x, goal.y, True)
+        length = abs(alpha * r) + d + abs(beta * r)
+        waypoints = [(start.x, start.y), (t1x, t1y), (t2x, t2y), (goal.x, goal.y)]
+        turn_points = [(t1x, t1y), (t2x, t2y)]
+        return DubinsPath(DubinsPathType.RSR, length, start, goal, waypoints, turn_points)
+
+    def _rsl_path(self, start: CarState, goal: CarState, r: float) -> Optional[DubinsPath]:
+        c1x = start.x + r * math.sin(start.theta)
+        c1y = start.y - r * math.cos(start.theta)
+        c2x = goal.x - r * math.sin(goal.theta)
+        c2y = goal.y + r * math.cos(goal.theta)
+        dx, dy = c2x - c1x, c2y - c1y
+        d = math.hypot(dx, dy)
+        if d < 2 * r:
+            return None
+        try:
+            phi = math.acos(2 * r / d)
+        except ValueError:
+            return None
+        theta_t = math.atan2(dy, dx) + phi
+        tx, ty = math.cos(theta_t), math.sin(theta_t)
+        t1x, t1y = c1x + r * tx, c1y + r * ty
+        t2x, t2y = c2x - r * tx, c2y - r * ty
+        alpha = self._arc_angle(start.x, start.y, c1x, c1y, t1x, t1y, True)
+        beta = self._arc_angle(t2x, t2y, c2x, c2y, goal.x, goal.y, False)
+        straight = math.hypot(t2x - t1x, t2y - t1y)
+        length = abs(alpha * r) + straight + abs(beta * r)
+        waypoints = [(start.x, start.y), (t1x, t1y), (t2x, t2y), (goal.x, goal.y)]
+        turn_points = [(t1x, t1y), (t2x, t2y)]
+        return DubinsPath(DubinsPathType.RSL, length, start, goal, waypoints, turn_points)
+
+    def _lsr_path(self, start: CarState, goal: CarState, r: float) -> Optional[DubinsPath]:
+        c1x = start.x - r * math.sin(start.theta)
+        c1y = start.y + r * math.cos(start.theta)
+        c2x = goal.x + r * math.sin(goal.theta)
+        c2y = goal.y - r * math.cos(goal.theta)
+        dx, dy = c2x - c1x, c2y - c1y
+        d = math.hypot(dx, dy)
+        if d < 2 * r:
+            return None
+        try:
+            phi = math.acos(2 * r / d)
+        except ValueError:
+            return None
+        theta_t = math.atan2(dy, dx) - phi
+        tx, ty = math.cos(theta_t), math.sin(theta_t)
+        t1x, t1y = c1x + r * tx, c1y + r * ty
+        t2x, t2y = c2x - r * tx, c2y - r * ty
+        alpha = self._arc_angle(start.x, start.y, c1x, c1y, t1x, t1y, False)
+        beta = self._arc_angle(t2x, t2y, c2x, c2y, goal.x, goal.y, True)
+        straight = math.hypot(t2x - t1x, t2y - t1y)
+        length = abs(alpha * r) + straight + abs(beta * r)
+        waypoints = [(start.x, start.y), (t1x, t1y), (t2x, t2y), (goal.x, goal.y)]
+        turn_points = [(t1x, t1y), (t2x, t2y)]
+        return DubinsPath(DubinsPathType.LSR, length, start, goal, waypoints, turn_points)
+
+    def _lsl_path(self, start: CarState, goal: CarState, r: float) -> Optional[DubinsPath]:
+        c1x = start.x - r * math.sin(start.theta)
+        c1y = start.y + r * math.cos(start.theta)
+        c2x = goal.x - r * math.sin(goal.theta)
+        c2y = goal.y + r * math.cos(goal.theta)
+        dx, dy = c2x - c1x, c2y - c1y
+        d = math.hypot(dx, dy)
+        if d < 1e-3:
+            return None
+        ux, uy = dy / d, -dx / d  # external tangent (opposite sign of RSR)
+        t1x, t1y = c1x + r * ux, c1y + r * uy
+        t2x, t2y = c2x + r * ux, c2y + r * uy
+        alpha = self._arc_angle(start.x, start.y, c1x, c1y, t1x, t1y, False)
+        beta = self._arc_angle(t2x, t2y, c2x, c2y, goal.x, goal.y, False)
+        length = abs(alpha * r) + d + abs(beta * r)
+        waypoints = [(start.x, start.y), (t1x, t1y), (t2x, t2y), (goal.x, goal.y)]
+        turn_points = [(t1x, t1y), (t2x, t2y)]
+        return DubinsPath(DubinsPathType.LSL, length, start, goal, waypoints, turn_points)
+
+    def _rlr_path(self, start: CarState, goal: CarState, r: float) -> Optional[DubinsPath]:
+        c1x = start.x + r * math.sin(start.theta)
+        c1y = start.y - r * math.cos(start.theta)
+        c2x = goal.x + r * math.sin(goal.theta)
+        c2y = goal.y - r * math.cos(goal.theta)
+        dx, dy = c2x - c1x, c2y - c1y
+        d = math.hypot(dx, dy)
+        if d > 4 * r or d < 1e-3:
+            return None
+        mx, my = (c1x + c2x) / 2, (c1y + c2y) / 2
+        h_sq = 4 * r * r - d * d / 4
+        if h_sq < 0:
+            return None
+        h = math.sqrt(h_sq)
+        if d <= 0:
+            return None
+        px, py = -dy / d, dx / d
+        c3x, c3y = mx + h * px, my + h * py
+        t1x, t1y = (c1x + c3x) / 2, (c1y + c3y) / 2
+        t2x, t2y = (c2x + c3x) / 2, (c2y + c3y) / 2
+        alpha = self._arc_angle(start.x, start.y, c1x, c1y, t1x, t1y, True)
+        beta = self._arc_angle(t1x, t1y, c3x, c3y, t2x, t2y, False)
+        gamma = self._arc_angle(t2x, t2y, c2x, c2y, goal.x, goal.y, True)
+        length = abs(alpha * r) + abs(beta * r) + abs(gamma * r)
+        waypoints = [(start.x, start.y), (t1x, t1y), (t2x, t2y), (goal.x, goal.y)]
+        turn_points = [(t1x, t1y), (t2x, t2y)]
+        return DubinsPath(DubinsPathType.RLR, length, start, goal, waypoints, turn_points)
+
+    def _lrl_path(self, start: CarState, goal: CarState, r: float) -> Optional[DubinsPath]:
+        c1x = start.x - r * math.sin(start.theta)
+        c1y = start.y + r * math.cos(start.theta)
+        c2x = goal.x - r * math.sin(goal.theta)
+        c2y = goal.y + r * math.cos(goal.theta)
+        dx, dy = c2x - c1x, c2y - c1y
+        d = math.hypot(dx, dy)
+        if d > 4 * r or d < 1e-3:
+            return None
+        mx, my = (c1x + c2x) / 2, (c1y + c2y) / 2
+        h_sq = 4 * r * r - d * d / 4
+        if h_sq < 0:
+            return None
+        h = math.sqrt(h_sq)
+        if d <= 0:
+            return None
+        px, py = dy / d, -dx / d
+        c3x, c3y = mx + h * px, my + h * py
+        t1x, t1y = (c1x + c3x) / 2, (c1y + c3y) / 2
+        t2x, t2y = (c2x + c3x) / 2, (c2y + c3y) / 2
+        alpha = self._arc_angle(start.x, start.y, c1x, c1y, t1x, t1y, False)
+        beta = self._arc_angle(t1x, t1y, c3x, c3y, t2x, t2y, True)
+        gamma = self._arc_angle(t2x, t2y, c2x, c2y, goal.x, goal.y, False)
+        length = abs(alpha * r) + abs(beta * r) + abs(gamma * r)
+        waypoints = [(start.x, start.y), (t1x, t1y), (t2x, t2y), (goal.x, goal.y)]
+        turn_points = [(t1x, t1y), (t2x, t2y)]
+        return DubinsPath(DubinsPathType.LRL, length, start, goal, waypoints, turn_points)
+
+    def _arc_angle(self, px: float, py: float, cx: float, cy: float,
+                   qx: float, qy: float, clockwise: bool) -> float:
+        v1x, v1y = px - cx, py - cy
+        v2x, v2y = qx - cx, qy - cy
+        angle = math.atan2(v2y, v2x) - math.atan2(v1y, v1x)
+        if clockwise:
+            if angle > 0:
+                angle -= 2 * math.pi
+        else:
+            if angle < 0:
+                angle += 2 * math.pi
+        return angle
+
+
+# ------------------- High-level planner with TSP -------------------
+class CarPathPlanner:
+    """Path planner with several strategies. Prefers shortest-time Hamiltonian (Held–Karp)."""
+
+    def __init__(self):
+        self.dubins_planner = DubinsPlanner()
+        self.arena_size = config.arena.size
+        self.grid_size = config.get_grid_size()
+        self.obstacles: List[Obstacle] = []
+
+        # Collision grid (1 = blocked, 0 = free)
+        self.collision_grid = np.zeros((self.grid_size, self.grid_size), dtype=int)
+
+    # ---- world / obstacle management ----
+    def add_obstacle(self, x: int, y: int, image_side: str):
+        obstacle = Obstacle(x, y, image_side)
+        self.obstacles.append(obstacle)
+        self._update_collision_grid()
+        print(f"Added obstacle {len(self.obstacles)-1} at ({x}, {y}) with image on {image_side} side")
+
+    def _update_collision_grid(self):
+        self.collision_grid.fill(0)
+        buffer = config.arena.collision_buffer
+        cell = config.arena.grid_cell_size
+        for obs in self.obstacles:
+            min_x = max(0, (obs.x - buffer) // cell)
+            max_x = min(self.grid_size, (obs.x + config.arena.obstacle_size + buffer) // cell)
+            min_y = max(0, (obs.y - buffer) // cell)
+            max_y = min(self.grid_size, (obs.y + config.arena.obstacle_size + buffer) // cell)
+            self.collision_grid[min_y:max_y, min_x:max_x] = 1
+
+    def get_image_target_position(self, obstacle: Obstacle) -> CarState:
+        """Pose where the robot should be to scan the image."""
+        d = config.car.camera_distance * 0.8
+        size = config.arena.obstacle_size
+        if obstacle.image_side == 'S':
+            x = obstacle.x + size / 2
+            y = obstacle.y - d
+            theta = math.pi / 2
+        elif obstacle.image_side == 'N':
+            x = obstacle.x + size / 2
+            y = obstacle.y + size + d
+            theta = 3 * math.pi / 2
+        elif obstacle.image_side == 'E':
+            x = obstacle.x + size + d
+            y = obstacle.y + size / 2
+            theta = math.pi
+        else:  # 'W'
+            x = obstacle.x - d
+            y = obstacle.y + size / 2
+            theta = 0.0
+        return CarState(x, y, theta)
+
+    # ------------------ Public planning API ------------------
+    def plan_visiting_path(self, start_state: CarState, obstacle_indices: List[int]) -> List[DubinsPath]:
+        """Primary method used by the rest of the system."""
+        print(f"Planning path from ({start_state.x:.1f}, {start_state.y:.1f}) to visit obstacles: {obstacle_indices}")
+        print(f"Available obstacles: {len(self.obstacles)}")
+
+        if not obstacle_indices:
+            print("No obstacles to visit")
+            return []
+
+        # 1) Try optimal Held–Karp (shortest-time Hamiltonian)
+        hk_paths = self.plan_shortest_time_hamiltonian(start_state, obstacle_indices)
+        if hk_paths:
+            total = sum(p.length for p in hk_paths)
+            print(f"Success with shortest_time_hamiltonian: {len(hk_paths)} segments, {total:.1f}cm")
+            return hk_paths
+
+        # 2) Fall back to previous strategies if HK fails for any reason
+        for algo in (self._greedy_nearest_neighbor, self._exhaustive_search, self._fallback_simple_path):
+            try:
+                result = algo(start_state, obstacle_indices)
+                if result.paths:
+                    print(f"Success with {result.algorithm_used}: {len(result.paths)} segments, {result.total_length:.1f}cm")
+                    return result.paths
+                else:
+                    print(f"Failed with {result.algorithm_used}: {result.debug_info}")
+            except Exception as e:
+                print(f"Error with algorithm: {e}")
+
+        print("All pathfinding algorithms failed")
+        return []
+
+    # ------------------ B.3: Held–Karp TSP on time ------------------
+    def plan_shortest_time_hamiltonian(self, start_state: CarState, obstacle_indices: List[int]) -> List[DubinsPath]:
+        """Compute the true shortest-time visiting order using Held–Karp DP."""
+        # Build target states
+        targets: List[Tuple[int, CarState]] = []
+        for idx in obstacle_indices:
+            if 0 <= idx < len(self.obstacles):
+                targets.append((idx, self.get_image_target_position(self.obstacles[idx])))
+
+        n = len(targets)
+        if n == 0:
+            return []
+
+        # Precompute costs and keep the actual best Dubins path for each directed edge
+        INF = 1e12
+        edge_time_start = [INF] * n
+        edge_path_start: List[Optional[DubinsPath]] = [None] * n
+
+        edge_time = [[INF] * n for _ in range(n)]
+        edge_path: List[List[Optional[DubinsPath]]] = [[None] * n for _ in range(n)]
+
+        # From start -> each target
+        for j in range(n):
+            dest = targets[j][1]
+            path = self.dubins_planner.plan_path(start_state, dest)
+            if path and not self._path_intersects_obstacles_strict(path):
+                edge_time_start[j] = self._estimate_time_for_path(path)
+                edge_path_start[j] = path
+
+        # Between targets
+        for i in range(n):
+            for j in range(n):
+                if i == j:
+                    continue
+                a = targets[i][1]
+                b = targets[j][1]
+                path = self.dubins_planner.plan_path(a, b)
+                if path and not self._path_intersects_obstacles_strict(path):
+                    edge_time[i][j] = self._estimate_time_for_path(path)
+                    edge_path[i][j] = path
+
+        # If any target unreachable from start, abort
+        if any(t >= INF for t in edge_time_start):
+            return []
+
+        # Held–Karp DP: dp[(mask, j)] = (time, prev_j)
+        # mask over n targets (0..n-1). Ending at j.
+        dp: Dict[Tuple[int, int], Tuple[float, Optional[int]]] = {}
+
+        # Base cases: start -> j
+        for j in range(n):
+            dp[(1 << j, j)] = (edge_time_start[j], None)
+
+        # Iterate over subset sizes
+        for size in range(2, n + 1):
+            for subset in combinations(range(n), size):
+                mask = 0
+                for k in subset:
+                    mask |= (1 << k)
+                for j in subset:
+                    best = (INF, None)
+                    prev_mask = mask ^ (1 << j)
+                    for i in subset:
+                        if i == j:
+                            continue
+                        if (prev_mask, i) in dp and edge_time[i][j] < INF:
+                            cand = dp[(prev_mask, i)][0] + edge_time[i][j]
+                            if cand < best[0]:
+                                best = (cand, i)
+                    if best[0] < INF:
+                        dp[(mask, j)] = best
+
+        # Pick best final end node (no return to start needed)
+        full_mask = (1 << n) - 1
+        best_final = (INF, None)
+        best_end = None
+        for j in range(n):
+            if (full_mask, j) in dp and dp[(full_mask, j)][0] < best_final[0]:
+                best_final = dp[(full_mask, j)]
+                best_end = j
+
+        if best_end is None:
+            return []
+
+        # Reconstruct order
+        order: List[int] = []
+        mask = full_mask
+        j = best_end
+        while j is not None:
+            order.append(j)
+            time_val, prev = dp[(mask, j)]
+            if prev is None:
+                break
+            mask ^= (1 << j)
+            j = prev
+        order.reverse()
+
+        # Build actual path sequence: start -> first -> ... -> last
+        segments: List[DubinsPath] = []
+        # Start to first
+        first = order[0]
+        segments.append(edge_path_start[first])
+        # Between targets
+        for a, b in zip(order[:-1], order[1:]):
+            segments.append(edge_path[a][b])
+
+        return segments
+
+    # ---- helpers: time estimate & collision checks ----
+    def _estimate_time_for_path(self, path: DubinsPath) -> float:
+        """
+        Convert a Dubins path into time using straight vs arc speeds:
+          t = L_straight / v_lin + L_arc / (r * omega)
+        """
+        v_lin = max(1e-6, config.car.linear_speed_cm_s)
+        omega = max(1e-6, config.car.angular_speed_rad_s)
+        r = max(1e-6, config.car.turning_radius)
+
+        # Straight length: only if the middle segment is 'S'
+        straight_len = 0.0
+        if 's' in path.path_type.value:
+            # waypoints[1] and [2] are tangent points (t1, t2) across the straight
+            if len(path.waypoints) >= 3:
+                x1, y1 = path.waypoints[1]
+                x2, y2 = path.waypoints[2]
+                straight_len = math.hypot(x2 - x1, y2 - y1)
+
+        arc_len = max(0.0, path.length - straight_len)
+        t_straight = straight_len / v_lin
+        t_arc = arc_len / (r * omega)
+
+        # Optional constant per-stop recognition time — same for every target, so it
+        # doesn't affect ordering; keep 0 to avoid bias.
+        return t_straight + t_arc
+
+    def _path_intersects_obstacles(self, path: DubinsPath) -> bool:
+        return self._path_intersects_obstacles_strict(path, buffer_reduction=0)
+
+    def _path_intersects_obstacles_strict(self, path: DubinsPath, buffer_reduction: float = 0) -> bool:
+        for i in range(len(path.waypoints) - 1):
+            x1, y1 = path.waypoints[i]
+            x2, y2 = path.waypoints[i + 1]
+            steps = max(3, int(math.hypot(x2 - x1, y2 - y1) / 10))
+            for step in range(steps + 1):
+                t = step / steps if steps > 0 else 0
+                x = x1 + t * (x2 - x1)
+                y = y1 + t * (y2 - y1)
+                buffer = max(1, int((config.arena.collision_buffer * (1 - buffer_reduction)) // config.arena.grid_cell_size))
+                gx = int(x / config.arena.grid_cell_size)
+                gy = int(y / config.arena.grid_cell_size)
+                if (gx < buffer or gx >= self.grid_size - buffer or
+                        gy < buffer or gy >= self.grid_size - buffer):
+                    return True
+                for dx in range(-buffer, buffer + 1):
+                    for dy in range(-buffer, buffer + 1):
+                        cx = gx + dx
+                        cy = gy + dy
+                        if (0 <= cx < self.grid_size and 0 <= cy < self.grid_size and
+                                self.collision_grid[cy, cx] == 1):
+                            return True
+        return False
+
+    # -------- legacy strategies kept as fallbacks --------
+    def _greedy_nearest_neighbor(self, start_state: CarState, obstacle_indices: List[int]) -> PathfindingResult:
+        targets = []
+        for idx in obstacle_indices:
+            if 0 <= idx < len(self.obstacles):
+                targets.append((idx, self.get_image_target_position(self.obstacles[idx])))
+        if not targets:
+            return PathfindingResult([], 0, "greedy_nearest_neighbor", {"error": "no_valid_targets"})
+
+        path_segments = []
+        total_length = 0.0
+        current_state = start_state
+        remaining = targets.copy()
+
+        while remaining:
+            best = None
+            best_seg = None
+            best_len = float('inf')
+            for cand_idx, cand_state in remaining:
+                seg = self.dubins_planner.plan_path(current_state, cand_state)
+                if seg and not self._path_intersects_obstacles(seg) and seg.length < best_len:
+                    best_len = seg.length
+                    best = (cand_idx, cand_state)
+                    best_seg = seg
+            if not best_seg:
+                return PathfindingResult([], 0, "greedy_nearest_neighbor", {"error": "no_valid_path", "remaining": len(remaining)})
+            path_segments.append(best_seg)
+            total_length += best_seg.length
+            current_state = best_seg.end_state
+            remaining.remove(best)
+
+        return PathfindingResult(path_segments, total_length, "greedy_nearest_neighbor", {"segments": len(path_segments)})
+
+    def _exhaustive_search(self, start_state: CarState, obstacle_indices: List[int]) -> PathfindingResult:
+        if len(obstacle_indices) > 5:
+            return PathfindingResult([], 0, "exhaustive_search", {"error": "too_many_targets"})
+        targets = []
+        for idx in obstacle_indices:
+            if 0 <= idx < len(self.obstacles):
+                targets.append((idx, self.get_image_target_position(self.obstacles[idx])))
+        if not targets:
+            return PathfindingResult([], 0, "exhaustive_search", {"error": "no_valid_targets"})
+
+        best_path = None
+        min_len = float('inf')
+        attempts = 0
+        for perm in permutations(targets):
+            attempts += 1
+            path_segments = []
+            total = 0.0
+            cur = start_state
+            valid = True
+            for _, tgt in perm:
+                seg = self.dubins_planner.plan_path(cur, tgt)
+                if not seg or self._path_intersects_obstacles_strict(seg):
+                    valid = False
+                    break
+                path_segments.append(seg)
+                total += seg.length
+                cur = tgt
+            if valid and total < min_len:
+                min_len = total
+                best_path = path_segments
+
+        if best_path:
+            return PathfindingResult(best_path, min_len, "exhaustive_search", {"attempts": attempts, "segments": len(best_path)})
+        return PathfindingResult([], 0, "exhaustive_search", {"error": "no_valid_permutation", "attempts": attempts})
+
+    def _fallback_simple_path(self, start_state: CarState, obstacle_indices: List[int]) -> PathfindingResult:
+        targets = []
+        for idx in obstacle_indices:
+            if 0 <= idx < len(self.obstacles):
+                targets.append((idx, self.get_image_target_position(self.obstacles[idx])))
+        if not targets:
+            return PathfindingResult([], 0, "fallback_simple", {"error": "no_valid_targets"})
+
+        path_segments = []
+        total = 0.0
+        cur = start_state
+        for obs_idx, tgt in targets:
+            seg = self.dubins_planner.plan_path(cur, tgt)
+            if seg:
+                path_segments.append(seg)
+                total += seg.length
+                cur = tgt
+            else:
+                print(f"Warning: Could not plan path to obstacle {obs_idx}")
+        return PathfindingResult(path_segments, total, "fallback_simple", {"segments": len(path_segments), "warnings": True})
+
+
+if __name__ == "__main__":
+    # Simple smoke test
+    planner = CarPathPlanner()
+    planner.add_obstacle(50, 50, 'S')
+    planner.add_obstacle(100, 100, 'E')
+    planner.add_obstacle(150, 50, 'N')
+    start = CarState(20, 20, 0)
+    paths = planner.plan_visiting_path(start, [0, 1, 2])
+    if paths:
+        total = sum(p.length for p in paths)
+        print(f"Final result: {len(paths)} segments, total length: {total:.1f}cm")
+        for i, seg in enumerate(paths):
+            print(f"  Segment {i}: {seg.path_type.value.upper()} ({seg.length:.1f}cm)")
+    else:
+        print("No valid path found")
+</file>
+
+<file path="algo/server/server.py">
+"""
+Flask server for robot car pathfinding API.
+Provides HTTP endpoints for car control, path planning, and status monitoring.
+"""
+
+from flask import Flask, request, jsonify
+import logging
+from typing import Dict, Any
+
+from algo.lib.controller import CarMissionManager
+from algo.lib.car import CarState, CarCommand, CarAction
+from algo.config import config
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+app = Flask(__name__)
+
+# Global mission manager instance
+mission_manager: CarMissionManager = None
+
+
+@app.before_first_request
+def initialize_server():
+    """Initialize the mission manager on first request."""
+    global mission_manager
+    mission_manager = CarMissionManager()
+    logger.info("Car pathfinding server initialized")
+
+
+@app.route('/health', methods=['GET'])
+def health_check():
+    """Health check endpoint."""
+    return jsonify({
+        "status": "healthy",
+        "service": "robot_car_pathfinding",
+        "config": {
+            "turning_radius": config.car.turning_radius,
+            "arena_size": f"{config.arena.size}x{config.arena.size}cm"
+        }
+    })
+
+
+@app.route('/car/initialize', methods=['POST'])
+def initialize_car():
+    """
+    Initialize car at starting position.
+
+    Expected JSON:
+    {
+        "x": 20.0,
+        "y": 20.0,
+        "theta": 0.0  // optional, defaults to 0
+    }
+    """
+    global mission_manager
+
+    try:
+        data = request.get_json()
+        if not data:
+            return jsonify({"error": "JSON data required"}), 400
+
+        x = float(data.get('x', 0))
+        y = float(data.get('y', 0))
+        theta = float(data.get('theta', 0))
+
+        # Validate position is within arena
+        if not (0 <= x <= config.arena.size and 0 <= y <= config.arena.size):
+            return jsonify({"error": "Position outside arena bounds"}), 400
+
+        mission_manager.initialize_car(x, y, theta)
+
+        logger.info(f"Car initialized at ({x}, {y}) facing {theta:.3f} rad")
+
+        return jsonify({
+            "status": "success",
+            "message": "Car initialized",
+            "position": {"x": x, "y": y, "theta": theta}
+        })
+
+    except Exception as e:
+        logger.error(f"Car initialization failed: {str(e)}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/obstacles/add', methods=['POST'])
+def add_obstacle():
+    """
+    Add an obstacle to the arena.
+
+    Expected JSON:
+    {
+        "x": 50,
+        "y": 50,
+        "image_side": "S"  // 'E', 'N', 'W', 'S'
+    }
+    """
+    global mission_manager
+
+    try:
+        data = request.get_json()
+        if not data:
+            return jsonify({"error": "JSON data required"}), 400
+
+        x = int(data.get('x'))
+        y = int(data.get('y'))
+        image_side = data.get('image_side', '').upper()
+
+        if image_side not in ['E', 'N', 'W', 'S']:
+            return jsonify({"error": "image_side must be E, N, W, or S"}), 400
+
+        # Validate obstacle position
+        if not (0 <= x <= config.arena.size - config.arena.obstacle_size and
+                0 <= y <= config.arena.size - config.arena.obstacle_size):
+            return jsonify({"error": "Obstacle position outside valid area"}), 400
+
+        obstacle_id = mission_manager.add_obstacle(x, y, image_side)
+
+        logger.info(f"Obstacle {obstacle_id} added at ({x}, {y}) with image on {image_side} side")
+
+        return jsonify({
+            "status": "success",
+            "obstacle_id": obstacle_id,
+            "position": {"x": x, "y": y},
+            "image_side": image_side
+        })
+
+    except Exception as e:
+        logger.error(f"Add obstacle failed: {str(e)}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/mission/plan', methods=['POST'])
+def plan_mission():
+    """
+    Plan a mission to visit specified obstacles.
+
+    Expected JSON:
+    {
+        "targets": [0, 1, 2]  // obstacle indices to visit
+    }
+    """
+    global mission_manager
+
+    try:
+        data = request.get_json() or {}
+        targets = data.get('targets', [])
+
+        if not isinstance(targets, list):
+            return jsonify({"error": "targets must be a list of obstacle indices"}), 400
+
+        success = mission_manager.plan_mission(targets)
+
+        if not success:
+            return jsonify({
+                "status": "failed",
+                "message": "Could not plan path to visit specified obstacles"
+            }), 400
+
+        logger.info(f"Mission planned to visit obstacles: {targets}")
+
+        return jsonify({
+            "status": "success",
+            "message": f"Mission planned to visit {len(targets)} obstacles",
+            "targets": targets
+        })
+
+    except Exception as e:
+        logger.error(f"Mission planning failed: {str(e)}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/car/next_action', methods=['GET'])
+def get_next_action():
+    """Get the next action for the car to perform."""
+    global mission_manager
+
+    try:
+        command = mission_manager.get_next_action()
+
+        if not command:
+            return jsonify({
+                "status": "no_action",
+                "message": "No action available (mission not planned or complete)"
+            })
+
+        response = {
+            "status": "success",
+            "action": command.action.value,
+            "parameters": command.parameters,
+            "expected_end_state": {
+                "x": command.expected_end_state.x,
+                "y": command.expected_end_state.y,
+                "theta": command.expected_end_state.theta
+            }
+        }
+
+        return jsonify(response)
+
+    except Exception as e:
+        logger.error(f"Get next action failed: {str(e)}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/car/execute', methods=['POST'])
+def execute_command():
+    """
+    Execute a car command and update position.
+
+    Expected JSON:
+    {
+        "action": "forward",
+        "parameters": {"distance": 10.0},
+        "actual_result": {  // optional - actual sensor readings
+            "measured_position": {"x": 25.2, "y": 20.1, "theta": 0.05}
+        }
+    }
+    """
+    global mission_manager
+
+    try:
+        data = request.get_json()
+        if not data:
+            return jsonify({"error": "JSON data required"}), 400
+
+        action_str = data.get('action', '')
+        parameters = data.get('parameters', {})
+        actual_result = data.get('actual_result', {})
+
+        # Parse action
+        try:
+            action = CarAction(action_str)
+        except ValueError:
+            return jsonify({"error": f"Invalid action: {action_str}"}), 400
+
+        # Create command (we need expected end state, but server doesn't know it)
+        # This is a limitation - ideally the command comes from get_next_action
+        current_status = mission_manager.car_status
+        if not current_status:
+            return jsonify({"error": "Car not initialized"}), 400
+
+        # Create a dummy command for execution tracking
+        command = CarCommand(action, parameters, current_status.estimated_state)
+
+        result = mission_manager.execute_command(command, actual_result)
+
+        logger.info(f"Executed {action_str} with result: {result['status']}")
+
+        return jsonify(result)
+
+    except Exception as e:
+        logger.error(f"Command execution failed: {str(e)}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/car/position', methods=['POST'])
+def update_car_position():
+    """
+    Manually update car position (for position corrections).
+
+    Expected JSON:
+    {
+        "x": 25.5,
+        "y": 30.2,
+        "theta": 0.52
+    }
+    """
+    global mission_manager
+
+    try:
+        data = request.get_json()
+        if not data:
+            return jsonify({"error": "JSON data required"}), 400
+
+        x = float(data.get('x'))
+        y = float(data.get('y'))
+        theta = float(data.get('theta'))
+
+        if not mission_manager.car_status:
+            return jsonify({"error": "Car not initialized"}), 400
+
+        # Update position directly
+        mission_manager.car_status.estimated_state = CarState(x, y, theta)
+        mission_manager.car_status.confidence_radius = 1.0  # Reset confidence
+
+        logger.info(f"Car position updated to ({x:.2f}, {y:.2f}, {theta:.3f})")
+
+        return jsonify({
+            "status": "success",
+            "message": "Position updated",
+            "position": {"x": x, "y": y, "theta": theta}
+        })
+
+    except Exception as e:
+        logger.error(f"Position update failed: {str(e)}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/status', methods=['GET'])
+def get_status():
+    """Get comprehensive system status."""
+    global mission_manager
+
+    try:
+        status = mission_manager.get_status()
+        return jsonify({
+            "status": "success",
+            "data": status
+        })
+
+    except Exception as e:
+        logger.error(f"Get status failed: {str(e)}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/reset', methods=['POST'])
+def reset_system():
+    """Reset the entire system."""
+    global mission_manager
+
+    try:
+        mission_manager = CarMissionManager()
+        logger.info("System reset complete")
+
+        return jsonify({
+            "status": "success",
+            "message": "System reset complete"
+        })
+
+    except Exception as e:
+        logger.error(f"System reset failed: {str(e)}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.errorhandler(404)
+def not_found(error):
+    return jsonify({"error": "Endpoint not found"}), 404
+
+
+@app.errorhandler(500)
+def internal_error(error):
+    return jsonify({"error": "Internal server error"}), 500
+
+
+if __name__ == '__main__':
+    print("=" * 60)
+    print("Robot Car Pathfinding Server")
+    print("=" * 60)
+    print("\nAvailable endpoints:")
+    print("  GET  /health              - Health check")
+    print("  POST /car/initialize      - Initialize car position")
+    print("  POST /obstacles/add       - Add obstacle to arena")
+    print("  POST /mission/plan        - Plan mission to visit obstacles")
+    print("  GET  /car/next_action     - Get next action for car")
+    print("  POST /car/execute         - Execute car command")
+    print("  POST /car/position        - Update car position")
+    print("  GET  /status              - Get system status")
+    print("  POST /reset               - Reset system")
+    print("\nKey features:")
+    print("  • Dubins path planning for car-like motion")
+    print("  • Position uncertainty handling")
+    print("  • Hamiltonian path optimization")
+    print("  • Collision avoidance")
+    print(f"\nStarting server on {config.server.host}:{config.server.port}")
+    print("=" * 60)
+
+    app.run(
+        host=config.server.host,
+        port=config.server.port,
+        debug=config.server.debug
+    )
+</file>
+
+<file path="algo/config.py">
+from dataclasses import dataclass
+
+
+@dataclass
+class RobotConfig:
+    width: float = 5  # cm
+    length: float = 5  # cm
+    turning_radius: float = 10.0  # minimum turning radius in cm
+    camera_distance: float = 10.0  # optimal distance from obstacle for image recognition
+
+    # Motion model (for time-cost)
+    linear_speed_cm_s: float = 10.0      # straight-line speed (cm/s)
+    angular_speed_rad_s: float = 1.2     # turning rate (rad/s); arc linear speed = r * omega
+    reverse_linear_speed_cm_s: float = 8.0
+    image_recognition_time_s: float = 0.0  # constant per target; doesn't change ordering, keep 0 unless needed
+
+    # motion uncertainty (kept as-is)
+    forward_motion_error: float = 0.0
+    turn_angle_error: float = 0.0
+    position_drift: float = 0.0
+
+
+@dataclass
+class Arena:
+    size: int = 200  # arena size in cm (200x200)
+    grid_cell_size: int = 5  # size of each grid cell in cm
+    obstacle_size: int = 5  # physical obstacle size in cm
+    collision_buffer: int = 30  # extra space around obstacles for collision avoidance
+
+
+@dataclass
+class PathfindingParams:
+    waypoint_tolerance: float = 15.0  # cm - how close to waypoint before advancing
+    angle_tolerance: float = 0.3      # radians - when car is considered aligned
+    max_forward_step: float = 8.0     # cm - maximum forward movement action
+    max_turn_step: float = 0.2        # radians how much is a maximum turn action
+
+
+class Config:
+    def __init__(self, config_file: str = 'car_config.json'):
+        self.config_file = config_file
+        self.car = RobotConfig()
+        self.arena = Arena()
+        self.pathfinding = PathfindingParams()
+
+    def get_grid_size(self) -> int:
+        return self.arena.size // self.arena.grid_cell_size
+
+
+# Global configuration (import and use this)
+config = Config()
+</file>
+
+<file path="algo/sim.py">
+import pygame
+import math
+import sys
+from typing import List, Tuple
+
+from lib.car import CarState, CarAction
+from lib.path import Obstacle, DubinsPath, DubinsPathType
+from lib.controller import CarMissionManager
+from config import config
+
+
+class Colors:
+    BLACK = (0, 0, 0); WHITE = (255, 255, 255); RED = (255, 0, 0)
+    GREEN = (0, 255, 0); BLUE = (0, 0, 255); YELLOW = (255, 255, 0)
+    ORANGE = (255, 165, 0); PURPLE = (128, 0, 128); GRAY = (128, 128, 128)
+    LIGHT_GRAY = (200, 200, 200); DARK_GREEN = (0, 100, 0); LIGHT_GREEN = (144, 238, 144)
+    LIGHT_BLUE = (173, 216, 230); DARK_BLUE = (0, 0, 139); MAGENTA = (255, 0, 255); CYAN = (0, 255, 255)
+
+
+class ImprovedCarVisualizer:
+    """Pygame-based car pathfinding visualizer with true Dubins curves."""
+
+    def __init__(self, width=1200, height=900):
+        pygame.init()
+        self.screen_width = width; self.screen_height = height
+        self.arena_size = config.arena.size
+
+        self.scale = min((width - 200) / self.arena_size, (height - 150) / self.arena_size)
+        self.offset_x = 100; self.offset_y = 75
+
+        self.screen = pygame.display.set_mode((width, height))
+        pygame.display.setcaption = pygame.display.set_caption
+        pygame.display.setcaption("Enhanced Robot Car Pathfinding - Dubins Paths")
+        self.clock = pygame.time.Clock()
+        self.font = pygame.font.Font(None, 24)
+        self.small_font = pygame.font.Font(None, 18)
+
+        self.obstacles: List[Obstacle] = []
+        self.planned_paths: List[DubinsPath] = []
+        self.car_state: CarState | None = None
+        self.target_positions: List[CarState] = []
+        self.car_trail: List[CarState] = []
+        self.current_target_highlight = -1
+        self.image_recognition_status = False
+        self.status_messages: List[str] = []
+
+        self.running = True; self.paused = False
+        self.show_grid = True; self.show_paths = True; self.show_waypoints = True
+        self.show_turning_circles = False
+        self.animation_speed = 1
+
+    # ---------- transforms ----------
+
+    def world_to_screen(self, x: float, y: float) -> Tuple[int, int]:
+        return int(self.offset_x + x * self.scale), int(self.offset_y + (self.arena_size - y) * self.scale)
+
+    def screen_to_world(self, sx: int, sy: int) -> Tuple[float, float]:
+        return (sx - self.offset_x) / self.scale, self.arena_size - (sy - self.offset_y) / self.scale
+
+    # ---------- drawing ----------
+
+    def draw_grid(self):
+        if not self.show_grid:
+            return
+        grid = 20
+        for i in range(0, self.arena_size + 1, grid):
+            sx1, sy1 = self.world_to_screen(i, 0); sx2, sy2 = self.world_to_screen(i, self.arena_size)
+            pygame.draw.line(self.screen, Colors.LIGHT_GRAY, (sx1, sy1), (sx2, sy2))
+            sx1, sy1 = self.world_to_screen(0, i); sx2, sy2 = self.world_to_screen(self.arena_size, i)
+            pygame.draw.line(self.screen, Colors.LIGHT_GRAY, (sx1, sy1), (sx2, sy2))
+
+    def draw_arena(self):
+        tl = self.world_to_screen(0, self.arena_size)
+        w = int(self.arena_size * self.scale); h = int(self.arena_size * self.scale)
+        pygame.draw.rect(self.screen, Colors.BLACK, (tl[0], tl[1], w, h), 3)
+
+        stl = self.world_to_screen(0, 40)
+        sw = int(40 * self.scale); sh = int(40 * self.scale)
+        pygame.draw.rect(self.screen, Colors.LIGHT_GREEN, (stl[0], stl[1], sw, sh))
+        pygame.draw.rect(self.screen, Colors.DARK_GREEN, (stl[0], stl[1], sw, sh), 2)
+        text = self.font.render("START", True, Colors.DARK_GREEN)
+        text_pos = self.world_to_screen(20, 20)
+        self.screen.blit(text, text.get_rect(center=text_pos))
+
+    def draw_obstacle(self, obstacle: Obstacle, obs_id: int):
+        size = config.arena.obstacle_size
+        top_left = self.world_to_screen(obstacle.x, obstacle.y + size)
+        w = int(size * self.scale); h = int(size * self.scale)
+
+        if obs_id == self.current_target_highlight:
+            pygame.draw.rect(self.screen, Colors.MAGENTA, (top_left[0] - 3, top_left[1] - 3, w + 6, h + 6))
+
+        pygame.draw.rect(self.screen, Colors.RED, (top_left[0], top_left[1], w, h))
+        pygame.draw.rect(self.screen, Colors.BLACK, (top_left[0], top_left[1], w, h), 2)
+
+        b = max(4, int(3 * self.scale))
+        if obstacle.image_side == 'S':
+            pos = self.world_to_screen(obstacle.x, obstacle.y - 1)
+            pygame.draw.rect(self.screen, Colors.YELLOW, (pos[0], pos[1], w, b))
+        elif obstacle.image_side == 'N':
+            pos = self.world_to_screen(obstacle.x, obstacle.y + size + 1)
+            pygame.draw.rect(self.screen, Colors.YELLOW, (pos[0], pos[1], w, b))
+        elif obstacle.image_side == 'E':
+            pos = self.world_to_screen(obstacle.x + size + 1, obstacle.y + size)
+            pygame.draw.rect(self.screen, Colors.YELLOW, (pos[0], pos[1], b, h))
+        else:
+            pos = self.world_to_screen(obstacle.x - 1, obstacle.y + size)
+            pygame.draw.rect(self.screen, Colors.YELLOW, (pos[0] - b, pos[1], b, h))
+
+        center = self.world_to_screen(obstacle.x + size / 2, obstacle.y + size / 2)
+        t = self.font.render(str(obs_id), True, Colors.WHITE)
+        self.screen.blit(t, t.get_rect(center=center))
+
+    def draw_car(self, s: CarState, color=Colors.BLUE):
+        cw = config.car.width * self.scale; cl = config.car.length * self.scale
+        corners = [(-cl/2, -cw/2), (cl/2, -cw/2), (cl/2, cw/2), (-cl/2, cw/2)]
+        c, si = math.cos(s.theta), math.sin(s.theta)
+        sc = []
+        for x, y in corners:
+            rx, ry = x * c - y * si, x * si + y * c
+            wx, wy = s.x + rx / self.scale, s.y + ry / self.scale
+            sc.append(self.world_to_screen(wx, wy))
+
+        body_color = Colors.CYAN if self.image_recognition_status and (pygame.time.get_ticks() // 200) % 2 else color
+        pygame.draw.polygon(self.screen, body_color, sc)
+        pygame.draw.polygon(self.screen, Colors.BLACK, sc, 2)
+
+        L = 20
+        sx, sy = self.world_to_screen(s.x, s.y)
+        ex, ey = self.world_to_screen(s.x + L * c, s.y + L * si)
+        pygame.draw.line(self.screen, Colors.RED, (sx, sy), (ex, ey), 4)
+        ah = 8; aa = 0.4
+        lx, ly = ex - ah * math.cos(s.theta - aa), ey - ah * math.sin(s.theta - aa)
+        rx, ry = ex - ah * math.cos(s.theta + aa), ey - ah * math.sin(s.theta + aa)
+        pygame.draw.polygon(self.screen, Colors.RED, [(ex, ey), (lx, ly), (rx, ry)])
+
+    # --------- NEW: true Dubins curve drawing ----------
+
+    def _circle_center(self, point: Tuple[float, float], heading: float, turn: str) -> Tuple[float, float]:
+        r = config.car.turning_radius
+        x, y = point
+        if turn.upper() == 'L':
+            return (x - r * math.sin(heading), y + r * math.cos(heading))
+        else:
+            return (x + r * math.sin(heading), y - r * math.cos(heading))
+
+    def _draw_arc(self, cx: float, cy: float, start: Tuple[float, float], end: Tuple[float, float],
+                  turn: str, width: int, color):
+        """Draw an arc between start and end around center (cx,cy)."""
+        r = config.car.turning_radius
+        a0 = math.atan2(start[1] - cy, start[0] - cx)
+        a1 = math.atan2(end[1] - cy, end[0] - cx)
+
+        def norm(a):
+            while a < 0: a += 2 * math.pi
+            while a >= 2 * math.pi: a -= 2 * math.pi
+            return a
+
+        a0 = norm(a0); a1 = norm(a1)
+        points = []
+        steps = max(8, int(abs(a1 - a0) * r / 2))  # smoothness based on arc length
+
+        if turn.upper() == 'L':
+            if a1 <= a0: a1 += 2 * math.pi
+            angles = [a0 + (a1 - a0) * i / steps for i in range(steps + 1)]
+        else:
+            if a0 <= a1: a0 += 2 * math.pi
+            angles = [a0 - (a0 - a1) * i / steps for i in range(steps + 1)]
+
+        for ang in angles:
+            x = cx + r * math.cos(ang)
+            y = cy + r * math.sin(ang)
+            points.append(self.world_to_screen(x, y))
+        if len(points) > 1:
+            pygame.draw.lines(self.screen, color, False, points, width)
+
+    def draw_curved_dubins_path(self, path: DubinsPath, color=Colors.BLUE, width=3):
+        if not self.show_paths or not path.waypoints:
+            return
+
+        wps = path.waypoints
+        ptype = (path.path_type.value if isinstance(path.path_type, DubinsPathType) else str(path.path_type)).lower()
+
+        # segment 0
+        if ptype[0] in ('l', 'r'):
+            start = wps[0]; t1 = wps[1]
+            cx, cy = self._circle_center(start, path.start_state.theta, ptype[0])
+            self._draw_arc(cx, cy, start, t1, ptype[0], width, color)
+        else:
+            s0 = self.world_to_screen(*wps[0]); s1 = self.world_to_screen(*wps[1])
+            pygame.draw.line(self.screen, color, s0, s1, width)
+
+        # segment 1 (straight)
+        mid0 = self.world_to_screen(*wps[1]); mid1 = self.world_to_screen(*wps[2])
+        pygame.draw.line(self.screen, color, mid0, mid1, width)
+
+        # segment 2
+        if ptype[2] in ('l', 'r'):
+            t2 = wps[2]; end = wps[3]
+            cx, cy = self._circle_center(end, path.end_state.theta, ptype[2])  # center determined by goal config
+            self._draw_arc(cx, cy, t2, end, ptype[2], width, color)
+        else:
+            e0 = self.world_to_screen(*wps[2]); e1 = self.world_to_screen(*wps[3])
+            pygame.draw.line(self.screen, color, e0, e1, width)
+
+        # Labels & waypoints
+        if self.show_waypoints:
+            for i, (x, y) in enumerate(wps):
+                pos = self.world_to_screen(x, y)
+                if i == 0:
+                    pygame.draw.circle(self.screen, Colors.GREEN, pos, 6)
+                    pygame.draw.circle(self.screen, Colors.BLACK, pos, 6, 2)
+                elif i == len(wps) - 1:
+                    pygame.draw.circle(self.screen, Colors.RED, pos, 6)
+                    pygame.draw.circle(self.screen, Colors.BLACK, pos, 6, 2)
+                else:
+                    pygame.draw.circle(self.screen, color, pos, 4)
+
+        mid = wps[len(wps)//2]
+        label_pos = self.world_to_screen(mid[0] + 8, mid[1] + 8)
+        label = (path.path_type.value if isinstance(path.path_type, DubinsPathType) else str(path.path_type)).upper()
+        self.screen.blit(self.small_font.render(label, True, color), label_pos)
+
+    # ---------- targets, trail, UI ----------
+
+    def draw_target_position(self, tstate: CarState, tid: int, is_current=False):
+        pos = self.world_to_screen(tstate.x, tstate.y)
+        size = 12 if is_current else 8
+        color = Colors.CYAN if is_current else Colors.PURPLE
+        pygame.draw.rect(self.screen, color, (pos[0] - size, pos[1] - size, size * 2, size * 2))
+        pygame.draw.rect(self.screen, Colors.BLACK, (pos[0] - size, pos[1] - size, size * 2, size * 2), 2)
+
+        L = 20
+        end = self.world_to_screen(tstate.x + L * math.cos(tstate.theta),
+                                   tstate.y + L * math.sin(tstate.theta))
+        pygame.draw.line(self.screen, color, pos, end, 4)
+        ah = 6; aa = 0.4
+        lx = end[0] - ah * math.cos(tstate.theta - aa); ly = end[1] - ah * math.sin(tstate.theta - aa)
+        rx = end[0] - ah * math.cos(tstate.theta + aa); ry = end[1] - ah * math.sin(tstate.theta + aa)
+        pygame.draw.polygon(self.screen, color, [end, (lx, ly), (rx, ry)])
+
+        text = self.small_font.render(f'T{tid}', True, color)
+        self.screen.blit(text, (pos[0] + 15, pos[1] - 15))
+
+    def draw_car_trail(self):
+        if len(self.car_trail) < 2: return
+        pts = [self.world_to_screen(s.x, s.y) for s in self.car_trail]
+        for i in range(len(pts) - 1):
+            surf = pygame.Surface((self.screen_width, self.screen_height))
+            alpha = max(50, int(255 * (i + 1) / len(pts)))
+            surf.set_alpha(alpha); surf.fill(Colors.WHITE); surf.set_colorkey(Colors.WHITE)
+            pygame.draw.line(surf, Colors.ORANGE, pts[i], pts[i + 1], 2)
+            self.screen.blit(surf, (0, 0))
+
+    def draw_ui(self):
+        title = self.font.render("Enhanced Robot Car Pathfinding - Dubins Paths", True, Colors.BLACK)
+        self.screen.blit(title, (10, 10))
+
+        ctrls = ["SPACE - Play/Pause", "G - Toggle Grid", "P - Toggle Paths",
+                 "W - Toggle Waypoints", "T - Toggle Turning Circles", "+/- - Speed", "R - Reset", "ESC - Exit"]
+        y = 35
+        for c in ctrls:
+            self.screen.blit(self.small_font.render(c, True, Colors.BLACK), (10, y)); y += 18
+
+        panel_x = self.screen_width - 300; panel_y = 10; pw = 280; ph = 200
+        pygame.draw.rect(self.screen, Colors.LIGHT_GRAY, (panel_x, panel_y, pw, ph))
+        pygame.draw.rect(self.screen, Colors.BLACK, (panel_x, panel_y, pw, ph), 2)
+
+        if self.car_state:
+            lines = ["CAR STATUS:",
+                     f"Position: ({self.car_state.x:.1f}, {self.car_state.y:.1f})",
+                     f"Heading: {math.degrees(self.car_state.theta):.1f}°",
+                     f"Speed: {self.animation_speed}x"]
+            if self.image_recognition_status: lines.append(">>> SCANNING IMAGE <<<")
+            for i, ln in enumerate(lines):
+                color = Colors.CYAN if "SCANNING" in ln else Colors.BLACK
+                self.screen.blit(self.small_font.render(ln, True, color), (panel_x + 10, panel_y + 15 + i * 18))
+
+        msg_y = panel_y + 120
+        for i, msg in enumerate(self.status_messages[-4:]):
+            self.screen.blit(self.small_font.render(msg, True, Colors.DARK_BLUE), (panel_x + 10, msg_y + i * 18))
+
+        if self.paused:
+            self.screen.blit(self.font.render("PAUSED", True, Colors.RED),
+                             (self.screen_width - 100, self.screen_height - 30))
+
+    def add_status_message(self, m: str):
+        self.status_messages.append(m)
+        if len(self.status_messages) > 10: self.status_messages.pop(0)
+
+    # ---------- input / loop ----------
+
+    def handle_events(self):
+        for e in pygame.event.get():
+            if e.type == pygame.QUIT: self.running = False
+            elif e.type == pygame.KEYDOWN:
+                if e.key == pygame.K_ESCAPE: self.running = False
+                elif e.key == pygame.K_SPACE: self.paused = not self.paused
+                elif e.key == pygame.K_g: self.show_grid = not self.show_grid
+                elif e.key == pygame.K_p: self.show_paths = not self.show_paths
+                elif e.key == pygame.K_w: self.show_waypoints = not self.show_waypoints
+                elif e.key == pygame.K_t: self.show_turning_circles = not self.show_turning_circles
+                elif e.key == pygame.K_r: self.reset()
+                elif e.key in (pygame.K_EQUALS, pygame.K_PLUS): self.animation_speed = min(5, self.animation_speed + 1)
+                elif e.key == pygame.K_MINUS: self.animation_speed = max(1, self.animation_speed - 1)
+
+    def reset(self):
+        self.car_trail = []; self.status_messages = []
+        if self.car_state: self.car_trail.append(CarState(self.car_state.x, self.car_state.y, self.car_state.theta))
+
+    def update(self): pass
+
+    def render(self):
+        self.screen.fill(Colors.WHITE)
+        self.draw_grid(); self.draw_arena()
+        for i, obs in enumerate(self.obstacles): self.draw_obstacle(obs, i)
+        for i, ts in enumerate(self.target_positions): self.draw_target_position(ts, i, i == self.current_target_highlight)
+        colors = [Colors.BLUE, Colors.DARK_GREEN, Colors.RED, Colors.PURPLE, Colors.ORANGE]
+        for i, path in enumerate(self.planned_paths): self.draw_curved_dubins_path(path, colors[i % len(colors)])
+        self.draw_car_trail()
+        if self.car_state: self.draw_car(self.car_state)
+        self.draw_ui()
+        pygame.display.flip()
+
+    def run(self):
+        while self.running:
+            self.handle_events()
+            if not self.paused:
+                for _ in range(self.animation_speed): self.update()
+            self.render(); self.clock.tick(60)
+        pygame.quit(); sys.exit()
+
+
+class EnhancedCarSimulation(ImprovedCarVisualizer):
+    """Enhanced car simulation with proper Dubins path following."""
+
+    def __init__(self):
+        super().__init__()
+        self.setup_simulation()
+        self.simulation_step = 0
+        self.max_steps = 2000
+        self.step_delay = 0
+
+    def setup_simulation(self):
+        self.manager = CarMissionManager()
+        self.manager.initialize_car(20, 20, 0)
+
+        # You can tweak these to force tight maneuvers / reversing if RS planner is enabled.
+        # Slightly spread out; still forward-friendly
+        obstacle_configs = [
+        (85, 95, 'E'),   # target ~ (98.0, 97.5), heading π (face west)
+        (100, 95, 'W'),  # target ~ (92.0, 97.5), heading 0 (face east)
+        (140, 60, 'N'),
+        (60, 140, 'S'),
+        ]
+        for x, y, side in obstacle_configs:
+            self.manager.add_obstacle(x, y, side)
+            self.obstacles.append(Obstacle(x, y, side))
+
+        target_indices = [0, 1, 2, 3]
+        if self.manager.plan_mission(target_indices):
+            self.planned_paths = self.manager.controller.current_path
+            self.add_status_message("Mission planned successfully!")
+            self.target_positions = [self.manager.path_planner.get_image_target_position(o)
+                                     for o in self.manager.path_planner.obstacles]
+        else:
+            self.add_status_message("Mission planning failed!")
+
+        self.car_state = self.manager.car_status.estimated_state
+        self.car_trail = [CarState(self.car_state.x, self.car_state.y, self.car_state.theta)]
+
+    def update(self):
+        if self.simulation_step >= self.max_steps: return
+        cmd = self.manager.get_next_action()
+        if not cmd:
+            self.add_status_message("No more commands"); return
+        if cmd.action == CarAction.STOP:
+            self.add_status_message("Mission complete!")
+
+        result = self.manager.execute_command(cmd)
+        self.car_state = self.manager.car_status.estimated_state
+        self.car_trail.append(CarState(self.car_state.x, self.car_state.y, self.car_state.theta))
+
+        progress = result.get('progress', {})
+        self.image_recognition_status = progress.get('at_target', False)
+        if progress.get('current_segment', -1) < len(self.target_positions):
+            self.current_target_highlight = progress.get('current_segment', -1)
+
+        if cmd.action == CarAction.FORWARD:
+            d = cmd.parameters.get('distance', 0)
+            if d > 0: self.add_status_message(f"Forward {d:.1f}cm")
+        elif cmd.action in (CarAction.TURN_LEFT, CarAction.TURN_RIGHT):
+            ang = cmd.parameters.get('angle', 0)
+            self.add_status_message(f"Turn {'left' if cmd.action==CarAction.TURN_LEFT else 'right'} {math.degrees(ang):.1f}°")
+
+        if progress.get('image_recognition_time', 0) > 0:
+            self.add_status_message(f"Scanning... ({progress['image_recognition_time']} frames)")
+
+        visited = len(self.manager.visited_targets)
+        if hasattr(self, '_last_visited_count') and visited > self._last_visited_count:
+            self.add_status_message(f"Target {visited - 1} completed!")
+        self._last_visited_count = visited
+        self.simulation_step += 1
+
+
+if __name__ == "__main__":
+    print("Enhanced Car Pathfinding Visualization")
+    print("=" * 45)
+    print("Features:")
+    print("- True Dubins curves (rendered)")
+    print("- Smooth controller (curvature & P-control)")
+    print("- Image recognition stops")
+    print("- Real-time status")
+    simulation = EnhancedCarSimulation()
+    simulation.run()
+</file>
+
+<file path=".gitignore">
+__pycache__/
+*.pyc
+</file>
+
+<file path="README.md">
+# SC2079-Group-15
+</file>
+
+</files>
