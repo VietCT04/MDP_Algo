@@ -1,0 +1,6 @@
+{
+    "start": {"x":20,"y":20,"theta":0.0},
+    "obstacles": [
+        {"x":60,"y":120,"image_side":"S"}
+    ]
+}
