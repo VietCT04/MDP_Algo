@@ -1,5 +1,5 @@
 """
-Lattice A* path planner with real turning radius arcs and long forward primitives.
+Lattice A* path planner with real turning-radius arcs and long forward primitives.
 
 Key points
 ----------
@@ -16,9 +16,11 @@ Key points
   * Segment/arc collision sampled ~every 2.5 cm
   * Wall margin = inflation
 - Output:
-  * Orders list [{op:'F'|'B', value_cm:..., pose:{x,y,theta,theta_deg}}, {op:'L'|'R', angle_deg:..., radius_cm:...}, ...]
+  * Orders list: [{op:'F'|'B', value_cm:..., pose:{x,y,theta,theta_deg}}, {op:'L'|'R', angle_deg:..., radius_cm:...}, ...]
   * Consecutive F (or B) merged automatically
-- Logging: prints neighbors tried, rejections, and A* progress every N expansions.
+- Goal tolerance:
+  * Position and heading epsilons taken from config.planner.{goal_pos_epsilon_cm, goal_heading_epsilon_deg}
+    (fallbacks: 7.5 cm and 10°)
 
 Assumes:
 - algorithm.lib.car.CarState
@@ -29,7 +31,6 @@ Assumes:
 import math
 import heapq
 from typing import List, Dict, Tuple, Optional
-import numpy as np
 
 from algorithm.lib.car import CarState
 from algorithm.lib.path import Obstacle
@@ -37,26 +38,29 @@ from algorithm.config import config
 
 
 deg = math.degrees
+rad = math.radians
 
 
 class CarPathPlanner:
     def __init__(self, grid_N: int = 2000):
         """
-        grid_N: number of grid cells per side (e.g., 2000 for 0.1 cm resolution on a 200 cm arena)
-                Resolution = arena.size / grid_N
+        grid_N: number of grid cells per side (e.g., 2000 for 1 cm if arena.size=2000,
+                or 0.1 cm if arena.size=200).
         """
-        self.field_cm = float(config.arena.size)   # e.g., 200.0 for 200 cm arena (or 2000 if your config uses cm directly)
+        self.field_cm = float(config.arena.size)
         self.grid_N   = int(grid_N)
         self.res_cm   = self.field_cm / self.grid_N  # grid resolution in cm/cell
-
-        # If your config.arena.size is actually 2000 (cm), you can still pass grid_N=2000 for 1 cm resolution.
-        # If it’s 200 (cm), grid_N=2000 gives 0.1 cm (very fine, slower). Adjust as you like.
 
         self.obstacles: List[Obstacle] = []
 
         # Debugging
         self.debug = True
         self._expand_log_every = 5000
+
+        # --- Goal tolerances (with safe defaults if not present in config) ---
+        planner_cfg = getattr(config, "planner", None)
+        self.goal_pos_eps_cm: float = float(getattr(planner_cfg, "goal_pos_epsilon_cm", 7.5))
+        self.goal_head_eps_deg: float = float(getattr(planner_cfg, "goal_heading_epsilon_deg", 10.0))
 
     # --------------------- Logging ---------------------
     def _log(self, msg: str):
@@ -67,9 +71,8 @@ class CarPathPlanner:
     def add_obstacle(self, x: float, y: float, image_side: str):
         """
         Obstacles are axis-aligned squares with size = config.arena.obstacle_size (in cm).
-        Pass obstacle top-left (x,y) like your existing code.
+        Pass obstacle top-left (x,y).
         """
-        # snap top-left to grid so collisions are stable
         gx = round(x / self.res_cm) * self.res_cm
         gy = round(y / self.res_cm) * self.res_cm
         self.obstacles.append(Obstacle(gx, gy, image_side))
@@ -103,20 +106,19 @@ class CarPathPlanner:
             x = ax + t*(bx-ax)
             y = ay + t*(by-ay)
             if i == 0 and allow_start_outside:
-                pass
-            else:
-                if not self._inside_walls(x, y):
-                    self._log(f"[seg_clear] OOB at ({x:.2f},{y:.2f})")
+                continue
+            if not self._inside_walls(x, y):
+                self._log(f"[seg_clear] OOB at ({x:.2f},{y:.2f})")
+                return False
+            for r in rects:
+                if self._pt_in_rect(x, y, r):
+                    self._log(f"[seg_clear] obstacle hit at ({x:.2f},{y:.2f}) in rect {r}")
                     return False
-                for r in rects:
-                    if self._pt_in_rect(x, y, r):
-                        self._log(f"[seg_clear] obstacle hit at ({x:.2f},{y:.2f}) in rect {r}")
-                        return False
         return True
 
     def _arc_end_pose(self, x: float, y: float, th: float, turn_dir: str, angle_deg: float) -> Tuple[float,float,float]:
         R = float(config.car.turning_radius)
-        dpsi = math.radians(angle_deg) * (1 if turn_dir.upper() == 'L' else -1)
+        dpsi = rad(angle_deg) * (1 if turn_dir.upper() == 'L' else -1)
         if turn_dir.upper() == 'L':
             cx = x - R * math.sin(th); cy = y + R * math.cos(th)
         else:
@@ -131,7 +133,7 @@ class CarPathPlanner:
         R = float(config.car.turning_radius)
         infl = self._inflation()
         rects = [self._rect_infl(o, infl) for o in self.obstacles]
-        dpsi = math.radians(angle_deg) * (1 if turn_dir.upper() == 'L' else -1)
+        dpsi = rad(angle_deg) * (1 if turn_dir.upper() == 'L' else -1)
 
         if turn_dir.upper() == 'L':
             cx = x - R * math.sin(th); cy = y + R * math.cos(th)
@@ -197,7 +199,6 @@ class CarPathPlanner:
         x, y = self._idx_to_xy(i, j)
         th   = self._bin_to_th(h)
 
-        # Forward / Backward primitives
         STEPS = list(range(10, 201, 10))  # 10..200 cm
         c, s = math.cos(th), math.sin(th)
 
@@ -208,8 +209,7 @@ class CarPathPlanner:
                 ii, jj = self._xy_to_idx(nx, ny)
                 yield (ii, jj, h, ("move", +1, d, (nx, ny, th)))
             else:
-                # If the *shorter* step is blocked, longer along same ray will also be blocked — stop early
-                break
+                break  # longer along same ray will also be blocked
 
         # BACKWARD (discourage but allow)
         for d in STEPS:
@@ -220,10 +220,9 @@ class CarPathPlanner:
             else:
                 break
 
-        # ARCS (only if needed)
+        # ARCS
         for turn_dir in ("L","R"):
-            # try 45 first (smaller overshoot), then 90
-            for ang in (45, 90):
+            for ang in (45, 90):  # smaller overshoot first
                 if self._arc_clear(x, y, th, turn_dir, ang, allow_start_outside=allow_start_outside):
                     nx, ny, nth = self._arc_end_pose(x, y, th, turn_dir, ang)
                     ii, jj = self._xy_to_idx(nx, ny)
@@ -233,8 +232,12 @@ class CarPathPlanner:
     # --------------------- Costs & Heuristic ---------------------
     def _cost(self, action) -> float:
         v_lin = max(1e-6, float(config.car.linear_speed_cm_s))
-        v_arc = min(v_lin, float(getattr(config.car, "turn_linear_cm_s", 0.0)) or
-                    float(config.car.turning_radius) * float(getattr(config.car, "angular_speed_rad_s", 0.0)) or v_lin)
+        v_arc = min(
+            v_lin,
+            float(getattr(config.car, "turn_linear_cm_s", 0.0)) or
+            float(config.car.turning_radius) * float(getattr(config.car, "angular_speed_rad_s", 0.0)) or
+            v_lin
+        )
         TURN_EPS = float(getattr(config.car, "turn_bias_seconds", 0.05))  # small per 45°
         BACKWARD_MULT = float(getattr(config.car, "backward_cost_mult", 1.25))
 
@@ -246,27 +249,31 @@ class CarPathPlanner:
                 t *= BACKWARD_MULT
             return t
         else:
-            _, turn_dir, ang, _ = action
-            s = float(config.car.turning_radius) * math.radians(ang)
+            _, _turn_dir, ang, _ = action
+            s = float(config.car.turning_radius) * rad(ang)
             base = s / v_arc
             per45 = int(round(ang / 45))
             return base + TURN_EPS * per45
 
     def _heur(self, i: int, j: int, h: int, gi: int, gj: int, gh: int) -> float:
-        """Admissible: straight-line time + minimal heading changes (coarse)."""
+        """Admissible: straight-line time + tiny heading-bias."""
         v_lin = max(1e-6, float(config.car.linear_speed_cm_s))
         dx = (gi - i) * self.res_cm
         dy = (gj - j) * self.res_cm
         dist = math.hypot(dx, dy)
         t_lin = dist / v_lin
 
-        # minimal number of 45° ticks to match heading bin
         delta = abs(gh - h)
         ticks = min(delta, 8 - delta)
         TURN_EPS = float(getattr(config.car, "turn_bias_seconds", 0.05))
-        return t_lin + TURN_EPS * ticks  # very small, keeps admissibility
+        return t_lin + TURN_EPS * ticks
 
-    # --------------------- A* search ---------------------
+    # --------------------- Helpers ---------------------
+    @staticmethod
+    def _angdiff(a: float, b: float) -> float:
+        """Smallest absolute difference between two angles (radians)."""
+        return abs((a - b + math.pi) % (2*math.pi) - math.pi)
+
     def _reconstruct(self, came, goal_key):
         path_actions = []
         k = goal_key
@@ -277,6 +284,69 @@ class CarPathPlanner:
         path_actions.reverse()
         return path_actions
 
+    # --------------------- A* search ---------------------
+    def _a_star(
+        self,
+        start: CarState,
+        goal: CarState,
+        pos_tol_cm: Optional[float] = None,
+        heading_tol_deg: Optional[float] = None,
+        max_expansions: int = 400000,
+    ):
+        # Select tolerances (use config defaults if None)
+        pos_tol = float(pos_tol_cm if pos_tol_cm is not None else self.goal_pos_eps_cm)
+        head_tol_rad = rad(heading_tol_deg if heading_tol_deg is not None else self.goal_head_eps_deg)
+
+        si, sj = self._xy_to_idx(start.x, start.y)
+        sh = self._th_to_bin(start.theta)
+        gi, gj = self._xy_to_idx(goal.x, goal.y)
+        gh = self._th_to_bin(goal.theta)
+
+        start_key = (si, sj, sh)
+        gscore = { start_key: 0.0 }
+        came: Dict[Tuple[int,int,int], Tuple[Tuple[int,int,int], tuple]] = {}
+
+        openh = []
+        heapq.heappush(
+            openh,
+            (self._heur(si, sj, sh, gi, gj, gh), 0.0, start_key, (start.x, start.y, start.theta))
+        )
+
+        expansions = 0
+
+        while openh:
+            f, g, key, pose = heapq.heappop(openh)
+            i, j, h = key
+            x, y, th = pose
+
+            expansions += 1
+            if expansions % self._expand_log_every == 0:
+                self._log(f"[A*] expansions={expansions}, open={len(openh)}, g={g:.3f}, f={f:.3f}")
+
+            # ---- tolerant goal test (epsilon in config) ----
+            if (math.hypot(x - goal.x, y - goal.y) <= pos_tol) and (self._angdiff(th, goal.theta) <= head_tol_rad):
+                actions = self._reconstruct(came, key)
+                return actions, (x, y, th)
+
+            # neighbors
+            for ni, nj, nh, action in self._successors(i, j, h, allow_start_outside=True if expansions == 1 else False):
+                nk = (ni, nj, nh)
+                ng = g + self._cost(action)
+                if ng + 1e-9 < gscore.get(nk, float('inf')):
+                    gscore[nk] = ng
+                    came[nk] = (key, action)
+                    _, _, _, cont = action
+                    nx, ny, nth = cont
+                    f_new = ng + self._heur(ni, nj, nh, gi, gj, gh)
+                    heapq.heappush(openh, (f_new, ng, nk, (nx, ny, nth)))
+
+            if expansions > max_expansions:
+                self._log("[A*] GAVE UP: expansion limit")
+                break
+
+        return None, None
+
+    # --------------------- Orders ---------------------
     def _compress_orders(self, actions: List[tuple], start_pose: CarState) -> Tuple[List[Dict], CarState]:
         """Merge consecutive F or B with same heading; emit arc orders as-is."""
         orders: List[Dict] = []
@@ -302,12 +372,11 @@ class CarPathPlanner:
 
         for a in actions:
             if a[0] == "move":
-                _, sign, d_cm, cont = a
+                _, sign, d_cm, _cont = a
                 want = 'F' if sign > 0 else 'B'
                 if run_kind in (None, want):
                     run_kind = want
                     run_dist += d_cm
-                    # update pose only when we flush (to keep cumulative)
                 else:
                     flush()
                     run_kind = want
@@ -329,70 +398,23 @@ class CarPathPlanner:
         flush()
         return orders, CarState(x, y, th)
 
-    def _a_star(self, start: CarState, goal: CarState,
-                pos_tol_cm: float = 0.5, require_heading=True, max_expansions=400000):
-        si, sj = self._xy_to_idx(start.x, start.y)
-        sh = self._th_to_bin(start.theta)
-        gi, gj = self._xy_to_idx(goal.x, goal.y)
-        gh = self._th_to_bin(goal.theta)
-
-        start_key = (si, sj, sh)
-        gscore = { start_key: 0.0 }
-        came: Dict[Tuple[int,int,int], Tuple[Tuple[int,int,int], tuple]] = {}
-
-        openh = []
-        heapq.heappush(openh, (self._heur(si,sj,sh,gi,gj,gh), 0.0, start_key, (start.x, start.y, start.theta)))
-
-        expansions = 0
-        best_seen = float('inf')
-
-        while openh:
-            f, g, key, pose = heapq.heappop(openh)
-            i, j, h = key
-            x, y, th = pose
-
-            expansions += 1
-            if expansions % self._expand_log_every == 0:
-                self._log(f"[A*] expansions={expansions}, open={len(openh)}, g_best={g:.3f}, f={f:.3f}")
-
-            # goal test
-            gx, gy = self._idx_to_xy(gi, gj)
-            if math.hypot(x - gx, y - gy) <= pos_tol_cm and (not require_heading or h == gh):
-                actions = self._reconstruct(came, key)
-                return actions, (x, y, th)
-
-            # neighbors
-            for ni, nj, nh, action in self._successors(i, j, h, allow_start_outside=True if expansions == 1 else False):
-                nk = (ni, nj, nh)
-                ng = g + self._cost(action)
-                if ng + 1e-9 < gscore.get(nk, float('inf')):
-                    gscore[nk] = ng
-                    came[nk] = (key, action)
-                    # continuous end pose for the node
-                    if action[0] == "arc":
-                        _, _, _, cont = action
-                    else:
-                        _, _, _, cont = action
-                    nx, ny, nth = cont
-                    f_new = ng + self._heur(ni, nj, nh, gi, gj, gh)
-                    heapq.heappush(openh, (f_new, ng, nk, (nx, ny, nth)))
-
-            if expansions > max_expansions:
-                self._log("[A*] GAVE UP: expansion limit")
-                break
-
-        return None, None
-
     # --------------------- Public API ---------------------
     def plan_orders_between(self, start: CarState, goal: CarState) -> List[Dict]:
         """
         Plan from start pose to goal pose using lattice A* and return merged orders.
         """
-        self._log(f"[plan_between] start=({start.x:.2f},{start.y:.2f},{deg(start.theta):.1f}°) "
-                  f"goal=({goal.x:.2f},{goal.y:.2f},{deg(goal.theta):.1f}°) "
-                  f"grid={self.grid_N}x{self.grid_N} res={self.res_cm:.3f}cm")
+        self._log(
+            f"[plan_between] start=({start.x:.2f},{start.y:.2f},{deg(start.theta):.1f}°) "
+            f"goal=({goal.x:.2f},{goal.y:.2f},{deg(goal.theta):.1f}°) "
+            f"grid={self.grid_N}x{self.grid_N} res={self.res_cm:.3f}cm "
+            f"tol=±{self.goal_pos_eps_cm:.1f}cm, ±{self.goal_head_eps_deg:.1f}°"
+        )
 
-        actions, final_pose = self._a_star(start, goal, pos_tol_cm=max(0.5, self.res_cm*1.5), require_heading=True)
+        actions, _final_pose = self._a_star(
+            start, goal,
+            pos_tol_cm=self.goal_pos_eps_cm,
+            heading_tol_deg=self.goal_head_eps_deg
+        )
         if actions is None:
             self._log("[plan_between] FAILED: no path")
             return []
@@ -401,11 +423,15 @@ class CarPathPlanner:
         self._log(f"[plan_between] SUCCESS: {len(orders)} orders")
         return orders
 
-    # Keep your obstacle/scan flow if you want to visit obstacles sequentially
+    # ---------- robust scan pose ----------
     def get_image_target_position(self, obstacle: Obstacle) -> CarState:
         size = float(config.arena.obstacle_size)
-        cell = max(self.res_cm, float(config.arena.grid_cell_size) if hasattr(config.arena, "grid_cell_size") else self.res_cm)
+        cell = max(
+            self.res_cm,
+            float(getattr(config.arena, "grid_cell_size", self.res_cm))
+        )
         infl = self._inflation()
+
         d_nominal = float(config.car.camera_distance) * 0.8
         d = max(d_nominal, infl + 0.51*cell)
 
@@ -416,10 +442,10 @@ class CarPathPlanner:
             x = obstacle.x + size/2.0; y = obstacle.y + size + d; th = 3*math.pi/2
         elif side == 'E':
             x = obstacle.x + size + d; y = obstacle.y + size/2.0; th = math.pi
-        else:
+        else:  # 'W'
             x = obstacle.x - d; y = obstacle.y + size/2.0; th = 0.0
 
-        # If scan pose is illegal, nudge outward up to +20 cm
+        # Nudge outward (≤ 20 cm) if illegal
         step = 1.0
         tries = 0
         while (not self._inside_walls(x, y)) or any(self._pt_in_rect(x, y, self._rect_infl(o, infl)) for o in self.obstacles):
@@ -435,7 +461,7 @@ class CarPathPlanner:
 
     def plan_visiting_orders_discrete(self, start_state: CarState, obstacle_indices: List[int]) -> List[Dict]:
         """
-        Optional: visit a list of obstacle indices in order, outputting F/B/L/R/S with merged straights.
+        Visit a list of obstacle indices in order, outputting F/B/L/R/S with merged straights.
         """
         orders_out: List[Dict] = []
         scan_sec = float(getattr(config.vision, "scan_seconds", 0.0))
@@ -451,16 +477,13 @@ class CarPathPlanner:
                 self._log(f"[visit] FAIL to reach obstacle {idx}")
                 return []
             orders_out.extend(segment_orders)
-            # Scan op
-            if orders_out:
-                last_pose = segment_orders[-1]["pose"]
-            else:
-                last_pose = {"x": round(goal.x,2), "y": round(goal.y,2),
-                             "theta": round(goal.theta,4), "theta_deg": round(deg(goal.theta),1)}
+
+            last_pose = segment_orders[-1]["pose"]
             s = {"op": "S", "obstacle_id": idx, "pose": last_pose}
             if scan_sec > 0:
                 s["scan_seconds"] = round(scan_sec, 2)
             orders_out.append(s)
+
             cur = CarState(last_pose["x"], last_pose["y"], last_pose["theta"])
 
         return orders_out
@@ -468,22 +491,18 @@ class CarPathPlanner:
 
 # --------------------- Example quick test ---------------------
 if __name__ == "__main__":
-    # Example configuration notes:
-    # If your arena is 200 cm, set config.arena.size = 200.0
-    # If your arena is 2000 cm (like some earlier configs), keep grid_N reasonable (e.g., 2000 → 1 cm resolution)
-    planner = CarPathPlanner(grid_N=2000)  # 2000x2000 grid over config.arena.size
+    # Example: choose grid to match your config scale (arena.size could be 200 or 2000).
+    planner = CarPathPlanner(grid_N=2000)
 
     # Obstacles (size 10 cm in your config)
     planner.add_obstacle(50, 130, 'S')
     planner.add_obstacle(20, 170, 'E')
 
-    # Start & goal example
     start = CarState(20, 20, math.pi/2)   # facing up
-    # Goal: a raw coordinate; or use get_image_target_position(obstacle)
-    goal  = CarState(55, 106, math.pi/2)  # e.g., scan pose for first obstacle S
+    goal  = CarState(55, 106, math.pi/2)  # e.g., scan pose
 
     orders = planner.plan_orders_between(start, goal)
     if orders:
-        print({"orders": orders})
+        print({"orders_count": len(orders), "last_pose": orders[-1]["pose"]})
     else:
         print({"status": "failed", "message": "Planner failed"})

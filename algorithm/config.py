@@ -1,6 +1,11 @@
 from dataclasses import dataclass
 
 @dataclass
+class planner:
+    goal_pos_epsilon_cm: float = 8.0
+    goal_heading_epsilon_deg: float = 30.0
+
+@dataclass
 class RobotConfig:
     width: float = 20
     length: float = 21
@@ -21,7 +26,7 @@ class vision:
 
 @dataclass
 class Arena:
-    size: int = 2000
+    size: int = 200
     grid_cell_size: int = 10
     obstacle_size: int = 10
     collision_buffer: int = 3
