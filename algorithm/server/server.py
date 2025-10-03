@@ -4,6 +4,7 @@ Provides HTTP endpoints for car control, path planning, and status monitoring.
 """
 
 from algorithm.lib.path import DubinsPath
+from algorithm.lib.pathfinding import CarPathPlanner
 from flask import Flask, request, jsonify
 import logging
 from typing import Dict, Any, List
@@ -245,6 +246,7 @@ def compile_orders():
         if not isinstance(data, dict):
             return jsonify({"error": "Body must be a JSON object (or a JSON string containing an object)."}), 400
         # ---- end parsing block ----
+        mode = "discrete"
 
         start = data.get("start") or {}
         sx = float(start.get("x", 20.0))
@@ -275,28 +277,38 @@ def compile_orders():
         else:
             targets = list(range(len(obstacles)))
 
-        tmp = CarMissionManager()
-        tmp.initialize_car(sx, sy, st)
-
+        planner = CarPathPlanner()
         for o in obstacles:
             x = int(o["x"]); y = int(o["y"]); side = str(o["image_side"]).upper()
             if not (0 <= x <= config.arena.size - config.arena.obstacle_size and
                     0 <= y <= config.arena.size - config.arena.obstacle_size):
                 return jsonify({"error": f"obstacle ({x},{y}) outside valid area"}), 400
-            tmp.add_obstacle(x, y, side)
+            planner.add_obstacle(x, y, side)
 
-        if not tmp.plan_mission(targets):
-            return jsonify({"status": "failed", "message": "Could not plan mission"}), 400
+        start_state = CarState(sx, sy, st)
 
-        planned_paths = tmp.controller.current_path
-        for p in planned_paths:
-            if not isinstance(p, DubinsPath):
-                raise RuntimeError("Expected DubinsPath in planned paths")
+        if mode == "discrete":  # <--- NEW: grid A* with only 45°/90° turns + F/B
+            orders = planner.plan_visiting_orders_discrete(start_state, targets)
+            if not orders:
+                return jsonify({"status":"failed","message":"Discrete planner failed"}), 400
+            payload = {"orders": orders}
+        else:
+            # ---- existing Dubins mission path via CarMissionManager ----
+            tmp = CarMissionManager()
+            tmp.initialize_car(sx, sy, st)
+            for o in obstacles:
+                tmp.add_obstacle(int(o["x"]), int(o["y"]), str(o["image_side"]).upper())
 
-        payload = export_compact_orders_from_paths(planned_paths)
+            if not tmp.plan_mission(targets):
+                return jsonify({"status":"failed","message":"Could not plan mission"}), 400
 
-        # --- Annotate each 'S' (scan/stop) with the corresponding obstacle_id in targets order ---
-        # We assume an 'S' is appended at the end of each target-reaching segment.
+            planned_paths = tmp.controller.current_path
+            for p in planned_paths:
+                if not isinstance(p, DubinsPath):
+                    raise RuntimeError("Expected DubinsPath in planned paths")
+            payload = export_compact_orders_from_paths(planned_paths)
+
+        # --- Annotate each 'S' with obstacle_id in targets order (same as before) ---
         target_id_queue = [index_to_obstacle_id[t] for t in targets]
         next_idx = 0
         if isinstance(payload, dict) and isinstance(payload.get("orders"), list):
@@ -305,8 +317,6 @@ def compile_orders():
                     if next_idx < len(target_id_queue):
                         cmd["obstacle_id"] = target_id_queue[next_idx]
                         next_idx += 1
-
-        print(payload)
 
         return jsonify(payload)
 

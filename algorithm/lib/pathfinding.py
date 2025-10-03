@@ -325,6 +325,8 @@ class CarPathPlanner:
                         a_ = A0 - (A0 - A1) * (k / n)
                         yield (c[0] + R*math.cos(a_), c[1] + R*math.sin(a_))
 
+                        
+
     def _build_forward_retreat(self, at: CarState, retreat_cm: float) -> Optional[DubinsPath]:
         """
         Create a small Dubins (forward-only) path that ends 'retreat_cm' behind the scan pose
@@ -474,6 +476,286 @@ class CarPathPlanner:
             segs.append(best_path)
             i = best_j
         return segs
+
+    def plan_visiting_orders_discrete(self, start_state: CarState, obstacle_indices: List[int]) -> List[Dict]:
+        """
+        Discrete planner with car-like constraints:
+        - Turns are *arcs* at fixed radius R, by 45° or 90° (no in-place spins).
+        - Straight moves are forward/back by one grid cell (coalesced).
+        Emits legacy orders: L/R (angle_deg ∈ {45,90}), F/B (value_cm integer), S (scan), optional B retreat.
+        """
+        cell = float(config.arena.grid_cell_size)
+        R = float(config.car.turning_radius)
+        v_lin = max(1e-6, float(config.car.linear_speed_cm_s))
+        # linear speed along an arc; prefer configured value if present, else R*omega
+        v_arc = float(getattr(config.car, "turn_linear_cm_s", 0.0)) or (R * max(1e-6, float(getattr(config.car, "angular_speed_rad_s", 0.0))) or v_lin)
+        scan_sec = float(getattr(config.vision, "scan_seconds", 0.0))
+        retreat_cm = float(getattr(config.car, "scan_retreat_cm", 0.0))
+
+        def _qpos(x: float, y: float) -> Tuple[float, float]:
+            return (round(x / cell) * cell, round(y / cell) * cell)
+
+        def _qhead(theta: float) -> int:
+            # heading index in {0..7} for multiples of 45°
+            step = int(round((theta % (2*math.pi)) / (math.pi/4))) % 8
+            return step
+
+        def _idx_theta(hidx: int) -> float:
+            return hidx * (math.pi/4)
+
+        def _inside_arena(x: float, y: float) -> bool:
+            inflation = float(config.car.width)/2.0 + float(config.arena.collision_buffer)
+            return (inflation <= x <= self.arena_size - inflation) and (inflation <= y <= self.arena_size - inflation)
+
+        def _rects_inflated():
+            inflation = float(config.car.width)/2.0 + float(config.arena.collision_buffer)
+            return [self._rect_inflated(o, inflation) for o in self.obstacles]
+
+        def _seg_collision_free(ax: float, ay: float, bx: float, by: float) -> bool:
+            rects = _rects_inflated()
+            size = float(self.arena_size)
+            inflation = float(config.car.width)/2.0 + float(config.arena.collision_buffer)
+            margin = inflation
+            L = max(1e-6, math.hypot(bx-ax, by-ay))
+            samples = max(2, int(L / 2.5))
+            for i in range(samples+1):
+                t = i / samples
+                x = ax + t*(bx-ax); y = ay + t*(by-ay)
+                if x < margin or x > size - margin or y < margin or y > size - margin:
+                    return False
+                for r in rects:
+                    if self._point_in_rect(x, y, r): return False
+            return True
+
+        def _arc_end_pose(x: float, y: float, th: float, turn_dir: str, steps_45: int) -> Tuple[float,float,float]:
+            """turn_dir in {'L','R'}, steps_45 in {1,2} (1=45°, 2=90°). Returns (nx,ny,nθ)."""
+            dth = steps_45 * (math.pi/4) * (1 if turn_dir == 'L' else -1)
+            # circle center using current pose and turn_dir
+            if turn_dir == 'L':
+                cx = x - R * math.sin(th)
+                cy = y + R * math.cos(th)
+            else:
+                cx = x + R * math.sin(th)
+                cy = y - R * math.cos(th)
+            # end pose on that circle after dth
+            th2 = (th + dth) % (2*math.pi)
+            nx = cx + (R * math.sin(th2)) if turn_dir == 'L' else cx + (R * math.sin(th2))
+            ny = cy - (R * math.cos(th2)) if turn_dir == 'L' else cy - (R * math.cos(th2))
+            return nx, ny, th2
+
+        def _arc_collision_free(x: float, y: float, th: float, turn_dir: str, steps_45: int) -> bool:
+            rects = _rects_inflated()
+            size = float(self.arena_size)
+            inflation = float(config.car.width)/2.0 + float(config.arena.collision_buffer)
+            margin = inflation
+
+            if turn_dir == 'L':
+                cx = x - R * math.sin(th); cy = y + R * math.cos(th)
+                a0 = math.atan2(y - cy, x - cx); a1 = a0 + steps_45 * (math.pi/4)
+                # sample CCW
+                if a1 <= a0: a1 += 2*math.pi
+                length = R * (a1 - a0)
+                n = max(3, int(length / 2.5))
+                for k in range(n+1):
+                    a = a0 + (a1 - a0) * (k / n)
+                    sx = cx + R * math.cos(a); sy = cy + R * math.sin(a)
+                    if sx < margin or sx > size - margin or sy < margin or sy > size - margin:
+                        return False
+                    for r in rects:
+                        if self._point_in_rect(sx, sy, r): return False
+            else:
+                cx = x + R * math.sin(th); cy = y - R * math.cos(th)
+                a0 = math.atan2(y - cy, x - cx); a1 = a0 - steps_45 * (math.pi/4)
+                # sample CW
+                if a0 <= a1: a0 += 2*math.pi
+                length = R * (a0 - a1)
+                n = max(3, int(length / 2.5))
+                for k in range(n+1):
+                    a = a0 - (a0 - a1) * (k / n)
+                    sx = cx + R * math.cos(a); sy = cy + R * math.sin(a)
+                    if sx < margin or sx > size - margin or sy < margin or sy > size - margin:
+                        return False
+                    for r in rects:
+                        if self._point_in_rect(sx, sy, r): return False
+            return True
+
+        def _neighbors(x: float, y: float, hidx: int):
+            """
+            Neighbor generator:
+            ('arc','L',1) -> left 45° arc;  ('arc','L',2) -> left 90° arc
+            ('arc','R',1) -> right 45° arc; ('arc','R',2) -> right 90° arc
+            ('move',+1) forward one cell;   ('move',-1) backward one cell
+            """
+            th = _idx_theta(hidx)
+
+            # arcs (require radius)
+            for turn_dir in ('L', 'R'):
+                for steps_45 in (1, 2):
+                    if _arc_collision_free(x, y, th, turn_dir, steps_45):
+                        nx, ny, nth = _arc_end_pose(x, y, th, turn_dir, steps_45)
+                        if _inside_arena(nx, ny):
+                            nh = _qhead(nth)
+                            # quantize xy for graph key
+                            qx, qy = _qpos(nx, ny)
+                            yield (qx, qy, nh, ('arc', turn_dir, steps_45, (nx, ny, nth)))
+
+            # forward / backward straight
+            dx, dy = cell * math.cos(th), cell * math.sin(th)
+            fx, fy = x + dx, y + dy
+            if _inside_arena(fx, fy) and _seg_collision_free(x, y, fx, fy):
+                yield (fx, fy, hidx, ('move', +1, (fx, fy, th)))
+            bx, by = x - dx, y - dy
+            if _inside_arena(bx, by) and _seg_collision_free(x, y, bx, by):
+                yield (bx, by, hidx, ('move', -1, (bx, by, th)))
+
+        def _cost(action) -> float:
+            kind = action[0]
+            if kind == 'arc':
+                _, _, steps_45, _ = action
+                dth = steps_45 * (math.pi/4)
+                s = R * dth
+                return s / v_arc
+            else:
+                # one cell
+                return cell / v_lin
+
+        def _heur(x: float, y: float, gx: float, gy: float) -> float:
+            # Straight-line time lower bound (ignores needed turns)
+            return math.hypot(gx - x, gy - y) / v_lin
+
+        def _astar(start: CarState, goal: CarState):
+            sx, sy = _qpos(start.x, start.y)
+            sh = _qhead(start.theta)
+            gx, gy = _qpos(goal.x, goal.y)
+
+            import heapq
+            start_key = (sx, sy, sh)
+            gscore = {start_key: 0.0}
+            came = {}  # (x,y,h) -> ((px,py,ph), action)
+            openh = []
+            heapq.heappush(openh, ( _heur(sx, sy, gx, gy), 0.0, start_key, (sx, sy, _idx_theta(sh)) ))
+
+            visited_pose_for_key = {start_key: (sx, sy, _idx_theta(sh))}
+
+            while openh:
+                _, g, key, pose = heapq.heappop(openh)
+                x, y, th = pose
+                if math.hypot(x - gx, y - gy) <= cell * 0.5:
+                    # reconstruct primitive actions
+                    actions = []
+                    cur_key = key
+                    while cur_key in came:
+                        prev_key, act = came[cur_key]
+                        actions.append(act)
+                        cur_key = prev_key
+                    actions.reverse()
+                    return actions, pose  # final continuous pose
+
+                kx, ky, kh = key
+                for nx, ny, nh, act in _neighbors(kx, ky, kh):
+                    nk = (nx, ny, nh)
+                    ng = g + _cost(act)
+                    if ng + 1e-9 < gscore.get(nk, float('inf')):
+                        gscore[nk] = ng
+                        came[nk] = (key, act)
+                        # store best pose seen for this key (for final pose output)
+                        if act[0] == 'arc':
+                            _, _, _, cont = act
+                            visited_pose_for_key[nk] = cont
+                        else:
+                            _, _, cont = act
+                            visited_pose_for_key[nk] = cont
+                        f = ng + _heur(nx, ny, gx, gy)
+                        heapq.heappush(openh, (f, ng, nk, visited_pose_for_key[nk]))
+            return None, None
+
+        def _actions_to_orders(actions, start_pose: CarState):
+            """
+            Convert primitives to orders. Coalesce straight runs; arcs become L/R with angle 45 or 90.
+            All outputs are integers.
+            """
+            orders: List[Dict] = []
+            x, y, th = start_pose.x, start_pose.y, start_pose.theta
+
+            def flush_run(run_kind: Optional[str], steps: int):
+                if not run_kind or steps == 0: return
+                dist = int(round(steps * cell))
+                pose = {"x": round(x,2), "y": round(y,2), "theta": round(th,4), "theta_deg": round(math.degrees(th),1)}
+                if run_kind == 'F':
+                    orders.append({"op": "F", "value_cm": dist, "pose": pose})
+                else:
+                    orders.append({"op": "B", "value_cm": dist, "pose": pose})
+
+            run_kind, steps = None, 0
+
+            for act in actions:
+                if act[0] == 'move':
+                    _, sign, cont = act
+                    nk = 'F' if sign > 0 else 'B'
+                    if run_kind is None or run_kind == nk:
+                        run_kind = nk; steps += 1
+                    else:
+                        flush_run(run_kind, steps); run_kind, steps = nk, 1
+                    x, y, th = cont  # already updated pose from neighbor
+                else:
+                    # arc turn
+                    flush_run(run_kind, steps); run_kind, steps = None, 0
+                    _, turn_dir, steps_45, cont = act
+                    angle = int(45 * steps_45)
+                    # after arc, pose is 'cont'
+                    x2, y2, th2 = cont
+                    pose = {"x": round(x2,2), "y": round(y2,2), "theta": round(th2,4), "theta_deg": round(math.degrees(th2),1)}
+                    if turn_dir == 'L':
+                        orders.append({"op": "L", "angle_deg": angle, "pose": pose})
+                    else:
+                        orders.append({"op": "R", "angle_deg": angle, "pose": pose})
+                    x, y, th = x2, y2, th2
+
+            flush_run(run_kind, steps)
+            return orders, CarState(x, y, th)
+
+        # -------- plan sequentially for the requested targets --------
+        cur = start_state
+        orders_out: List[Dict] = []
+        for idx in obstacle_indices:
+            if idx < 0 or idx >= len(self.obstacles):
+                continue
+            goal = self.get_image_target_position(self.obstacles[idx])
+
+            actions, final_pose = _astar(cur, goal)
+            if actions is None:
+                return []
+
+            seg_orders, cur = _actions_to_orders(actions, cur)
+            orders_out.extend(seg_orders)
+
+            # Scan at the target
+            s = {"op": "S", "pose": {
+                    "x": round(cur.x,2), "y": round(cur.y,2),
+                    "theta": round(cur.theta,4), "theta_deg": round(math.degrees(cur.theta),1)
+                }}
+            if scan_sec > 0:
+                s["scan_seconds"] = round(scan_sec, 2)
+            orders_out.append(s)
+
+            # Optional straight retreat
+            if retreat_cm > 0:
+                bx = cur.x - retreat_cm * math.cos(cur.theta)
+                by = cur.y - retreat_cm * math.sin(cur.theta)
+                if _seg_collision_free(cur.x, cur.y, bx, by):
+                    orders_out.append({
+                        "op": "B",
+                        "value_cm": int(round(retreat_cm)),
+                        "pose": {"x": round(bx,2), "y": round(by,2),
+                                "theta": round(cur.theta,4), "theta_deg": round(math.degrees(cur.theta),1)}
+                    })
+                    cur = CarState(bx, by, cur.theta)
+
+        return orders_out
+
+
+
+        
     
     def plan_hybrid_astar(self, start: CarState, goal: CarState) -> Optional[List[DubinsPath]]:
         """
