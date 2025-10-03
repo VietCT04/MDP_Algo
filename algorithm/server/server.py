@@ -8,7 +8,7 @@ from flask import Flask, request, jsonify
 import logging
 from typing import Dict, Any, List
 import math
-
+import json
 
 from algorithm.lib.controller import CarMissionManager
 from algorithm.lib.car import CarState, CarCommand, CarAction
@@ -214,18 +214,37 @@ def compile_orders():
     """
     Plan a full mission from a single request and return ALL movement orders at once.
 
-    Request JSON:
+    Request JSON shape (now supports obstacle_id):
     {
-      "start": {"x": 20.0, "y": 20.0, "theta": 0.0},   // optional; defaults to 20,20,0 if omitted
+      "start": {"x": 20.0, "y": 20.0, "theta": 0.0},
       "obstacles": [
-        {"x": 60, "y": 120, "image_side": "N"},
-        {"x": 140, "y": 80, "image_side": "E"}
+        {"obstacle_id": 0, "x": 60, "y": 120, "image_side": "N"},
+        {"obstacle_id": 1, "x": 140, "y": 80, "image_side": "E"},
+        {"obstacle_id": 2, "x": 180, "y": 180, "image_side": "S"}
       ],
-      "targets": [0,1]   // optional; if omitted we pass all obstacle indices in insertion order
+      "targets": [0, 1, 2]   // optional; defaults to all obstacles in order
     }
     """
     try:
-        data = request.get_json() or {}
+        # ---- permissive JSON object parsing ----
+        data = request.get_json(silent=True)
+        if isinstance(data, str):
+            try:
+                data = json.loads(data)
+            except json.JSONDecodeError:
+                return jsonify({"error": "Body was a JSON string, but not valid JSON."}), 400
+        if data is None:
+            raw = (request.get_data(as_text=True) or "").strip()
+            if raw:
+                try:
+                    data = json.loads(raw)
+                except json.JSONDecodeError:
+                    return jsonify({"error": "Body must be valid JSON."}), 400
+            else:
+                data = {}
+        if not isinstance(data, dict):
+            return jsonify({"error": "Body must be a JSON object (or a JSON string containing an object)."}), 400
+        # ---- end parsing block ----
 
         start = data.get("start") or {}
         sx = float(start.get("x", 20.0))
@@ -236,18 +255,25 @@ def compile_orders():
         if not isinstance(obstacles, list) or not obstacles:
             return jsonify({"error": "obstacles must be a non-empty list"}), 400
 
+        # Build a mapping from internal obstacle index -> user obstacle_id (or fallback to index)
+        index_to_obstacle_id: list[int] = []
         for i, o in enumerate(obstacles):
             if not all(k in o for k in ("x", "y", "image_side")):
                 return jsonify({"error": f"obstacle #{i} missing x/y/image_side"}), 400
-            if str(o["image_side"]).upper() not in ("N","E","S","W"):
+            if str(o["image_side"]).upper() not in ("N", "E", "S", "W"):
                 return jsonify({"error": f"obstacle #{i} image_side must be one of N,E,S,W"}), 400
+            try:
+                oid = int(o.get("obstacle_id", i))   # <--- NEW: accept obstacle_id, fallback to position
+            except (TypeError, ValueError):
+                return jsonify({"error": f"obstacle #{i} obstacle_id must be integer if provided"}), 400
+            index_to_obstacle_id.append(oid)
 
         if "targets" in data:
             if not isinstance(data["targets"], list):
                 return jsonify({"error": "targets must be a list of indices"}), 400
             targets = list(map(int, data["targets"]))
         else:
-            targets = list(range(len(obstacles))) 
+            targets = list(range(len(obstacles)))
 
         tmp = CarMissionManager()
         tmp.initialize_car(sx, sy, st)
@@ -260,21 +286,32 @@ def compile_orders():
             tmp.add_obstacle(x, y, side)
 
         if not tmp.plan_mission(targets):
-            return jsonify({"status":"failed","message":"Could not plan mission"}), 400
-        
-        # === NEW: export directly from planned Dubins geometry ===
+            return jsonify({"status": "failed", "message": "Could not plan mission"}), 400
+
         planned_paths = tmp.controller.current_path
-        #print("Planned paths:", planned_paths)
         for p in planned_paths:
             if not isinstance(p, DubinsPath):
                 raise RuntimeError("Expected DubinsPath in planned paths")
-            #print(f"  {p.path_type.value} length={p.length:.1f}cm waypoints={p.waypoints}")
+
         payload = export_compact_orders_from_paths(planned_paths)
+
+        # --- Annotate each 'S' (scan/stop) with the corresponding obstacle_id in targets order ---
+        # We assume an 'S' is appended at the end of each target-reaching segment.
+        target_id_queue = [index_to_obstacle_id[t] for t in targets]
+        next_idx = 0
+        if isinstance(payload, dict) and isinstance(payload.get("orders"), list):
+            for cmd in payload["orders"]:
+                if cmd.get("op") == "S":
+                    if next_idx < len(target_id_queue):
+                        cmd["obstacle_id"] = target_id_queue[next_idx]
+                        next_idx += 1
+
         return jsonify(payload)
 
     except Exception as e:
         logger.exception("compile_orders failed")
         return jsonify({"error": str(e)}), 500
+
 
 @app.route('/obstacles/add', methods=['POST'])
 def add_obstacle():

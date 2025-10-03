@@ -45,7 +45,7 @@ def export_compact_orders_from_paths(paths: List[DubinsPath]) -> Dict:
     R = float(config.car.turning_radius)
     v_lin = float(config.car.linear_speed_cm_s)
     v_arc = float(R * getattr(config.car, "angular_speed_rad_s", 0.0)) or v_lin
-    scan_sec = float(getattr(config.vision, "scan_seconds", 0.0))
+    #scan_sec = float(getattr(config.vision, "scan_seconds", 0.0))
 
     def _emit_F(a: Tuple[float,float], b: Tuple[float,float]) -> Dict:
         dx, dy = b[0]-a[0], b[1]-a[1]
@@ -125,8 +125,8 @@ def export_compact_orders_from_paths(paths: List[DubinsPath]) -> Dict:
         if is_scan_stop:
             s = {"op": "S",
                  "pose": _pose_dict(seg.end_state.x, seg.end_state.y, seg.end_state.theta)}
-            if scan_sec > 0:
-                s["scan_seconds"] = round(scan_sec, 2)
+            #if scan_sec > 0:
+            #    s["scan_seconds"] = round(scan_sec, 2)
             orders.append(s)
 
     # Coalesce consecutive F’s
@@ -152,7 +152,22 @@ def export_compact_orders_from_paths(paths: List[DubinsPath]) -> Dict:
             pretty.append(f"{c['op']} {c['angle_deg']}°")
         elif c["op"] in ("F", "B"):
             pretty.append(f"{c['op']} {c['value_cm']}cm")
-        else:
-            pretty.append("S" if "scan_seconds" not in c else f"S ({c['scan_seconds']}s)")
-
-    return {"meta": meta_out, "orders": coalesced, "orders_text": pretty, "status": "success"}
+        #else:
+            #pretty.append("S" if "scan_seconds" not in c else f"S ({c['scan_seconds']}s)")
+    
+    for cmd in coalesced:
+        if cmd["op"] in ("F", "B") and "value_cm" in cmd:
+            val = int(math.ceil(cmd["value_cm"]))
+            cmd["value_cm"] = val
+            # keep timing consistent with rounded distance
+            if v_lin > 0:
+                cmd["time_s"] = round(val / v_lin, 3)
+        elif cmd["op"] in ("L", "R") and "angle_deg" in cmd:
+            ang = int(math.ceil(cmd["angle_deg"]))
+            cmd["angle_deg"] = ang
+            # keep timing consistent with rounded angle
+            if v_arc > 0:
+                # v_arc is linear cm/s along the arc; arc length = R * radians
+                cmd["time_s"] = round((R * math.radians(ang)) / v_arc, 3)
+    
+    return {"orders": coalesced}
