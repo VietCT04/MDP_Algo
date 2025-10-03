@@ -306,6 +306,8 @@ def compile_orders():
                         cmd["obstacle_id"] = target_id_queue[next_idx]
                         next_idx += 1
 
+        print(payload)
+
         return jsonify(payload)
 
     except Exception as e:

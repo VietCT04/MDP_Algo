@@ -4,7 +4,7 @@ from dataclasses import dataclass
 class RobotConfig:
     width: float = 20
     length: float = 21
-    turning_radius: float = 15.0
+    turning_radius: float = 24.5
     camera_distance: float = 25.0
     linear_speed_cm_s: float = 10.0
     angular_speed_rad_s: float = 1.2
