@@ -487,8 +487,12 @@ class CarPathPlanner:
         cell = float(config.arena.grid_cell_size)
         R = float(config.car.turning_radius)
         v_lin = max(1e-6, float(config.car.linear_speed_cm_s))
-        # linear speed along an arc; prefer configured value if present, else R*omega
-        v_arc = float(getattr(config.car, "turn_linear_cm_s", 0.0)) or (R * max(1e-6, float(getattr(config.car, "angular_speed_rad_s", 0.0))) or v_lin)
+        # linear speed along an arc; prefer configured value if present, else R*omega (fallback to v_lin)
+        v_arc = float(getattr(config.car, "turn_linear_cm_s", 0.0))
+        if not v_arc:
+            omega = float(getattr(config.car, "angular_speed_rad_s", 0.0))
+            v_arc = R * omega if omega > 0 else v_lin
+
         scan_sec = float(getattr(config.vision, "scan_seconds", 0.0))
         retreat_cm = float(getattr(config.car, "scan_retreat_cm", 0.0))
 
@@ -528,20 +532,29 @@ class CarPathPlanner:
             return True
 
         def _arc_end_pose(x: float, y: float, th: float, turn_dir: str, steps_45: int) -> Tuple[float,float,float]:
-            """turn_dir in {'L','R'}, steps_45 in {1,2} (1=45°, 2=90°). Returns (nx,ny,nθ)."""
-            dth = steps_45 * (math.pi/4) * (1 if turn_dir == 'L' else -1)
-            # circle center using current pose and turn_dir
+            """
+            Compute end (x,y,theta) after an arc turn of 45° or 90° at radius R.
+            turn_dir in {'L','R'}, steps_45 in {1,2}. (FIXED right-turn math)
+            """
+            dpsi = steps_45 * (math.pi / 4) * (1 if turn_dir == 'L' else -1)
+
+            # circle center from current pose
             if turn_dir == 'L':
                 cx = x - R * math.sin(th)
                 cy = y + R * math.cos(th)
             else:
                 cx = x + R * math.sin(th)
                 cy = y - R * math.cos(th)
-            # end pose on that circle after dth
-            th2 = (th + dth) % (2*math.pi)
-            nx = cx + (R * math.sin(th2)) if turn_dir == 'L' else cx + (R * math.sin(th2))
-            ny = cy - (R * math.cos(th2)) if turn_dir == 'L' else cy - (R * math.cos(th2))
-            return nx, ny, th2
+
+            # current center-angle (angle of the radius vector)
+            a0 = math.atan2(y - cy, x - cx)
+            a1 = a0 + dpsi  # move along the circle by the same signed angle
+
+            # new pose is on that circle; heading updates by dpsi too
+            nx = cx + R * math.cos(a1)
+            ny = cy + R * math.sin(a1)
+            nth = (th + dpsi) % (2 * math.pi)
+            return nx, ny, nth
 
         def _arc_collision_free(x: float, y: float, th: float, turn_dir: str, steps_45: int) -> bool:
             rects = _rects_inflated()
@@ -592,14 +605,13 @@ class CarPathPlanner:
             for turn_dir in ('L', 'R'):
                 for steps_45 in (1, 2):
                     if _arc_collision_free(x, y, th, turn_dir, steps_45):
-                        nx, ny, nth = _arc_end_pose(x, y, th, turn_dir, steps_45)
+                        nx, ny, nth = _arc_end_pose(x, y, th, turn_dir, steps_45)  # <— fixed
                         if _inside_arena(nx, ny):
                             nh = _qhead(nth)
-                            # quantize xy for graph key
                             qx, qy = _qpos(nx, ny)
                             yield (qx, qy, nh, ('arc', turn_dir, steps_45, (nx, ny, nth)))
 
-            # forward / backward straight
+            # forward / backward straight (one grid cell)
             dx, dy = cell * math.cos(th), cell * math.sin(th)
             fx, fy = x + dx, y + dy
             if _inside_arena(fx, fy) and _seg_collision_free(x, y, fx, fy):
@@ -616,32 +628,35 @@ class CarPathPlanner:
                 s = R * dth
                 return s / v_arc
             else:
-                # one cell
+                # one cell straight
                 return cell / v_lin
 
         def _heur(x: float, y: float, gx: float, gy: float) -> float:
-            # Straight-line time lower bound (ignores needed turns)
+            # straight-line lower-bound time (ignores turns)
             return math.hypot(gx - x, gy - y) / v_lin
 
         def _astar(start: CarState, goal: CarState):
+            # quantize start and goal positions; enforce goal heading bucket
             sx, sy = _qpos(start.x, start.y)
             sh = _qhead(start.theta)
             gx, gy = _qpos(goal.x, goal.y)
+            gh = _qhead(goal.theta)
 
             import heapq
             start_key = (sx, sy, sh)
             gscore = {start_key: 0.0}
             came = {}  # (x,y,h) -> ((px,py,ph), action)
             openh = []
-            heapq.heappush(openh, ( _heur(sx, sy, gx, gy), 0.0, start_key, (sx, sy, _idx_theta(sh)) ))
+            heapq.heappush(openh, (_heur(sx, sy, gx, gy), 0.0, start_key, (sx, sy, _idx_theta(sh))))
 
             visited_pose_for_key = {start_key: (sx, sy, _idx_theta(sh))}
 
             while openh:
                 _, g, key, pose = heapq.heappop(openh)
                 x, y, th = pose
-                if math.hypot(x - gx, y - gy) <= cell * 0.5:
-                    # reconstruct primitive actions
+
+                # SUCCESS only if near the goal *and* heading matches goal bin
+                if (math.hypot(x - gx, y - gy) <= cell * 0.5) and (_qhead(th) == gh):
                     actions = []
                     cur_key = key
                     while cur_key in came:
@@ -661,10 +676,9 @@ class CarPathPlanner:
                         # store best pose seen for this key (for final pose output)
                         if act[0] == 'arc':
                             _, _, _, cont = act
-                            visited_pose_for_key[nk] = cont
                         else:
                             _, _, cont = act
-                            visited_pose_for_key[nk] = cont
+                        visited_pose_for_key[nk] = cont
                         f = ng + _heur(nx, ny, gx, gy)
                         heapq.heappush(openh, (f, ng, nk, visited_pose_for_key[nk]))
             return None, None
@@ -672,7 +686,7 @@ class CarPathPlanner:
         def _actions_to_orders(actions, start_pose: CarState):
             """
             Convert primitives to orders. Coalesce straight runs; arcs become L/R with angle 45 or 90.
-            All outputs are integers.
+            All outputs are integers (angles 45/90, distance N*cell in cm).
             """
             orders: List[Dict] = []
             x, y, th = start_pose.x, start_pose.y, start_pose.theta
@@ -696,13 +710,12 @@ class CarPathPlanner:
                         run_kind = nk; steps += 1
                     else:
                         flush_run(run_kind, steps); run_kind, steps = nk, 1
-                    x, y, th = cont  # already updated pose from neighbor
+                    x, y, th = cont  # apply pose from neighbor
                 else:
                     # arc turn
                     flush_run(run_kind, steps); run_kind, steps = None, 0
                     _, turn_dir, steps_45, cont = act
-                    angle = int(45 * steps_45)
-                    # after arc, pose is 'cont'
+                    angle = int(45 * steps_45)  # 45 or 90
                     x2, y2, th2 = cont
                     pose = {"x": round(x2,2), "y": round(y2,2), "theta": round(th2,4), "theta_deg": round(math.degrees(th2),1)}
                     if turn_dir == 'L':
@@ -753,10 +766,6 @@ class CarPathPlanner:
 
         return orders_out
 
-
-
-        
-    
     def plan_hybrid_astar(self, start: CarState, goal: CarState) -> Optional[List[DubinsPath]]:
         """
         Hybrid A*: A* over (x,y,theta) with short motion primitives,
@@ -899,6 +908,7 @@ class CarPathPlanner:
             x = obstacle.x - d
             y = obstacle.y + size / 2
             theta = 0.0
+        print(x, y, obstacle.x, obstacle.y, d)
         return CarState(x, y, theta)
     
     def _build_retreat_line(self, at: CarState, retreat_cm: float) -> Optional[DubinsPath]:
