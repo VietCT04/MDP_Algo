@@ -5,7 +5,7 @@ class RobotConfig:
     width: float = 20
     length: float = 21
     turning_radius: float = 24.5
-    camera_distance: float = 20.0
+    camera_distance: float = 30.0
     linear_speed_cm_s: float = 10.0
     angular_speed_rad_s: float = 1.2
     reverse_linear_speed_cm_s: float = 8.0
@@ -13,7 +13,7 @@ class RobotConfig:
     forward_motion_error: float = 0.0
     turn_angle_error: float = 0.0
     position_drift: float = 0.0
-    scan_retreat_cm: float = 12.0
+    scan_retreat_cm: float = 15.0
 
 @dataclass
 class vision:
@@ -21,7 +21,7 @@ class vision:
 
 @dataclass
 class Arena:
-    size: int = 200
+    size: int = 2000
     grid_cell_size: int = 10
     obstacle_size: int = 10
     collision_buffer: int = 3
