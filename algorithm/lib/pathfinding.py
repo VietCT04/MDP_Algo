@@ -426,14 +426,23 @@ class CarPathPlanner:
     # ---------- robust scan pose ----------
     def get_image_target_position(self, obstacle: Obstacle) -> CarState:
         size = float(config.arena.obstacle_size)
-        cell = max(
-            self.res_cm,
-            float(getattr(config.arena, "grid_cell_size", self.res_cm))
-        )
+        cell = max(self.res_cm, float(getattr(config.arena, "grid_cell_size", self.res_cm)))
         infl = self._inflation()
 
-        d_nominal = float(config.car.camera_distance) * 0.8
-        d = max(d_nominal, infl + 0.51*cell)
+        # --- read camera distance robustly (car or vision), no silent shrink ---
+        cam_dist = (
+            getattr(getattr(config, "car", object()), "camera_distance", None)
+            or getattr(getattr(config, "vision", object()), "camera_distance", None)
+            or getattr(getattr(config, "vision", object()), "camera_distance_cm", None)
+            or 30.0
+        )
+        # optional scale knob (default 1.0)
+        scale = float(getattr(getattr(config, "planner", object()), "scan_distance_scale", 1.0))
+        d_nominal = float(cam_dist) * scale
+
+        # keep-out so the car doesn’t clip the obstacle/wall
+        keepout = infl + 0.51 * cell
+        d = max(d_nominal, keepout)
 
         side = obstacle.image_side.upper()
         if side == 'S':
@@ -445,7 +454,7 @@ class CarPathPlanner:
         else:  # 'W'
             x = obstacle.x - d; y = obstacle.y + size/2.0; th = 0.0
 
-        # Nudge outward (≤ 20 cm) if illegal
+        # Nudge outward (≤ 20 cm) if still illegal
         step = 1.0
         tries = 0
         while (not self._inside_walls(x, y)) or any(self._pt_in_rect(x, y, self._rect_infl(o, infl)) for o in self.obstacles):
@@ -457,7 +466,10 @@ class CarPathPlanner:
             else:                x -= step
             tries += 1
 
+        # helpful debug: see what distance was used
+        self._log(f"[scan_pose] side={side} cam={cam_dist}cm scale={scale} -> d={d:.1f}cm keepout={keepout:.1f}cm")
         return CarState(x, y, th)
+
 
     def plan_visiting_orders_discrete(self, start_state: CarState, obstacle_indices: List[int]) -> List[Dict]:
         """

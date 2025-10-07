@@ -252,6 +252,8 @@ def compile_orders():
         sx = float(start.get("x", 20.0))
         sy = float(start.get("y", 20.0))
         st = float(start.get("theta", 0.0))
+        sx = sx - config.arena.translation
+        sy = sy - config.arena.translation
 
         obstacles = data.get("obstacles", [])
         if not isinstance(obstacles, list) or not obstacles:
@@ -280,6 +282,8 @@ def compile_orders():
         planner = CarPathPlanner()
         for o in obstacles:
             x = int(o["x"]); y = int(o["y"]); side = str(o["image_side"]).upper()
+            x = x - 2 * config.arena.translation
+            y = y - 2 * config.arena.translation
             if not (0 <= x <= config.arena.size - config.arena.obstacle_size and
                     0 <= y <= config.arena.size - config.arena.obstacle_size):
                 return jsonify({"error": f"obstacle ({x},{y}) outside valid area"}), 400

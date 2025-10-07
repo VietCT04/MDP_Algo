@@ -10,7 +10,7 @@ class RobotConfig:
     width: float = 20
     length: float = 21
     turning_radius: float = 24.5
-    camera_distance: float = 30.0
+    camera_distance: float = 40.0
     linear_speed_cm_s: float = 10.0
     angular_speed_rad_s: float = 1.2
     reverse_linear_speed_cm_s: float = 8.0
@@ -30,6 +30,7 @@ class Arena:
     grid_cell_size: int = 10
     obstacle_size: int = 10
     collision_buffer: int = 3
+    translation: int = 5
 
 @dataclass
 class PathfindingParams:
