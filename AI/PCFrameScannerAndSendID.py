@@ -74,6 +74,7 @@ def main():
 
             # Fix inverted image (flip vertically)
             frame = cv2.flip(frame, 0)
+            frame = cv2.flip(frame, 1)
 
             # Run YOLO detection
             results = model(frame, conf=CONF_THRESHOLD, verbose=False)[0]
@@ -92,15 +93,13 @@ def main():
                 cv2.putText(frame, label, (x1, y1 - 10),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 
-
-                # Save the annotated frame
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                save_path = os.path.join(SAVE_DIR, f"detection_{obstacle_id}_{timestamp}.jpg")
-                cv2.imwrite(save_path, frame)
-                print(f"Saved detected frame: {save_path}")
-
             else:
                 class_id = 0  # No detection
+
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            save_path = os.path.join(SAVE_DIR, f"detection_{obstacle_id}_{class_id}_{timestamp}.jpg")
+            cv2.imwrite(save_path, frame)
+            print(f"Saved detected frame: {save_path}")
 
             # Prepare response
             response = {

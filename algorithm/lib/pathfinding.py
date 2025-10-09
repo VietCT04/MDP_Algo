@@ -459,7 +459,8 @@ class CarPathPlanner:
         tries = 0
         while (not self._inside_walls(x, y)) or any(self._pt_in_rect(x, y, self._rect_infl(o, infl)) for o in self.obstacles):
             if tries > 20:
-                raise ValueError("scan pose not clear after nudging")
+                return None
+                #raise ValueError("scan pose not clear after nudging")
             if side == 'S':      y -= step
             elif side == 'N':    y += step
             elif side == 'E':    x += step
@@ -483,6 +484,8 @@ class CarPathPlanner:
             if not (0 <= idx < len(self.obstacles)):
                 continue
             goal = self.get_image_target_position(self.obstacles[idx])
+            if (goal is None):
+                continue
             self._log(f"[visit] target#{idx} scan_pose=({goal.x:.2f},{goal.y:.2f},{deg(goal.theta):.1f}°)")
             segment_orders = self.plan_orders_between(cur, goal)
             if not segment_orders:

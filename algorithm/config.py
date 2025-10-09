@@ -9,10 +9,11 @@ class planner:
 class RobotConfig:
     width: float = 20
     length: float = 21
-    turning_radius: float = 24.5
+    turning_radius: float = 29
     camera_distance: float = 40.0
     linear_speed_cm_s: float = 10.0
-    angular_speed_rad_s: float = 1.2
+    angular_speed_rad_s: float = 40.2
+    turn_linear_cm_s: float = 40.2
     reverse_linear_speed_cm_s: float = 8.0
     image_recognition_time_s: float = 0.0
     forward_motion_error: float = 0.0
