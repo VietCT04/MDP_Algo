@@ -1,25 +1,29 @@
 """
-Lattice A* path planner with real turning-radius arcs and long forward primitives.
+Lattice A* path planner with real turning-radius arcs, long forward primitives,
+and configurable forward slip before L/R turns.
 
 Key points
 ----------
-- State space: (i, j, h) on a fine grid, where i,j are grid indices and h∈{0..7} (every 45°).
+- State space: (i, j, h) on a fine grid, h∈{0..7} (every 45°).
 - Motion primitives (generated on-the-fly):
   * F d, B d with d ∈ {10, 20, ..., 200} cm along current heading
-  * L/R arc with angle in {45°, 90°} at radius R = config.car.turning_radius (no in-place spins)
+  * L/R arc with angle in {45°, 90°} at radius R = config.car.turning_radius
+    (now modeled as: pre-slip straight of s(cm) → arc)
 - Costs:
   * Straight: time = distance / v_lin
-  * Arc: time = arc_length / min(v_lin, v_arc) + small per-45° bias
+  * Arc: time = (slip / v_lin) + (arc_length / v_arc) + small per-45° bias
   * Reverse multiplies time by BACKWARD_MULT (>1)
 - Safety:
-  * Robot collision inflation = car.width/2 + arena.collision_buffer
-  * Segment/arc collision sampled ~every 2.5 cm
+  * Robot inflation = car.width/2 + arena.collision_buffer
+  * Segment/arc collision sampled ~every 2.5 cm (slip is also checked)
   * Wall margin = inflation
-- Output:
-  * Orders list: [{op:'F'|'B', value_cm:..., pose:{x,y,theta,theta_deg}}, {op:'L'|'R', angle_deg:..., radius_cm:...}, ...]
-  * Consecutive F (or B) merged automatically
+- Output orders:
+  * [{'op':'F'|'B','value_cm':...,'pose':{x,y,theta,theta_deg}},
+     {'op':'L'|'R','angle_deg':..., 'radius_cm':..., 'pre_slip_cm': s,
+      'pose':{x,y,theta,theta_deg}}, ...]
+    Straights (F/B) are merged automatically.
 - Goal tolerance:
-  * Position and heading epsilons taken from config.planner.{goal_pos_epsilon_cm, goal_heading_epsilon_deg}
+  * From config.planner.{goal_pos_epsilon_cm, goal_heading_epsilon_deg}
     (fallbacks: 7.5 cm and 10°)
 
 Assumes:
@@ -35,7 +39,6 @@ from typing import List, Dict, Tuple, Optional
 from algorithm.lib.car import CarState
 from algorithm.lib.path import Obstacle
 from algorithm.config import config
-
 
 deg = math.degrees
 rad = math.radians
@@ -57,7 +60,7 @@ class CarPathPlanner:
         self.debug = True
         self._expand_log_every = 5000
 
-        # --- Goal tolerances (with safe defaults if not present in config) ---
+        # Goal tolerances (safe defaults)
         planner_cfg = getattr(config, "planner", None)
         self.goal_pos_eps_cm: float = float(getattr(planner_cfg, "goal_pos_epsilon_cm", 7.5))
         self.goal_head_eps_deg: float = float(getattr(planner_cfg, "goal_heading_epsilon_deg", 10.0))
@@ -67,12 +70,45 @@ class CarPathPlanner:
         if self.debug:
             print(msg)
 
+    # --------------------- Turn-slip model ---------------------
+    def _turn_slip(self, angle_deg: float) -> float:
+        """
+        Return forward slip distance (cm) executed immediately BEFORE an L/R turn.
+        Config options (in order of precedence):
+          - config.planner.turn_forward_slip_cm_per_deg
+          - config.planner.turn_forward_slip_cm_45 / _90
+        """
+        pcfg = getattr(config, "planner", None)
+        if pcfg is None:
+            return 0.0
+
+        per_deg = getattr(pcfg, "turn_forward_slip_cm_per_deg", None)
+        if per_deg is not None:
+            try:
+                return float(per_deg) * float(angle_deg)
+            except Exception:
+                pass
+
+        # Discrete values
+        s45 = float(getattr(pcfg, "turn_forward_slip_cm_45", 0.0))
+        s90 = float(getattr(pcfg, "turn_forward_slip_cm_90", s45 * 2.0 if s45 > 0 else 0.0))
+
+        # If we get a non 45/90 angle (future), interpolate
+        if abs(angle_deg - 45.0) < 1e-6:
+            return s45
+        if abs(angle_deg - 90.0) < 1e-6:
+            return s90
+        # linear interpolation by degrees
+        if s45 > 0.0 or s90 > 0.0:
+            # prefer s90 slope if set
+            base = s90 / 90.0 if s90 > 0.0 else s45 / 45.0
+            return base * float(angle_deg)
+
+        return 0.0
+
     # --------------------- Obstacle mgmt ---------------------
     def add_obstacle(self, x: float, y: float, image_side: str):
-        """
-        Obstacles are axis-aligned squares with size = config.arena.obstacle_size (in cm).
-        Pass obstacle top-left (x,y).
-        """
+        """Obstacles are axis-aligned squares, pass top-left (x,y) in cm."""
         gx = round(x / self.res_cm) * self.res_cm
         gy = round(y / self.res_cm) * self.res_cm
         self.obstacles.append(Obstacle(gx, gy, image_side))
@@ -93,7 +129,7 @@ class CarPathPlanner:
 
     @staticmethod
     def _pt_in_rect(px: float, py: float, r: Tuple[float,float,float,float]) -> bool:
-        x0,y0,x1,y1 = r
+        x0, y0, x1, y1 = r
         return (x0 <= px <= x1) and (y0 <= py <= y1)
 
     def _segment_clear(self, ax: float, ay: float, bx: float, by: float, allow_start_outside=False) -> bool:
@@ -117,59 +153,80 @@ class CarPathPlanner:
         return True
 
     def _arc_end_pose(self, x: float, y: float, th: float, turn_dir: str, angle_deg: float) -> Tuple[float,float,float]:
+        """
+        End pose after executing: slip straight s(cm) along heading, then arc turn.
+        """
+        s = self._turn_slip(angle_deg)
+        # slip first
+        x1 = x + s * math.cos(th)
+        y1 = y + s * math.sin(th)
+
         R = float(config.car.turning_radius)
         dpsi = rad(angle_deg) * (1 if turn_dir.upper() == 'L' else -1)
         if turn_dir.upper() == 'L':
-            cx = x - R * math.sin(th); cy = y + R * math.cos(th)
+            cx = x1 - R * math.sin(th); cy = y1 + R * math.cos(th)
         else:
-            cx = x + R * math.sin(th); cy = y - R * math.cos(th)
-        a0 = math.atan2(y - cy, x - cx)
+            cx = x1 + R * math.sin(th); cy = y1 - R * math.cos(th)
+        a0 = math.atan2(y1 - cy, x1 - cx)
         a1 = a0 + dpsi
         nx = cx + R * math.cos(a1); ny = cy + R * math.sin(a1)
         nth = (th + dpsi) % (2*math.pi)
         return nx, ny, nth
 
     def _arc_clear(self, x: float, y: float, th: float, turn_dir: str, angle_deg: float, allow_start_outside=False) -> bool:
+        """
+        Check slip segment and the arc path for collisions and wall violations.
+        """
+        s = self._turn_slip(angle_deg)
+        # Check the slip straight
+        sx = x + s * math.cos(th)
+        sy = y + s * math.sin(th)
+        if s > 0.0:
+            if not self._segment_clear(x, y, sx, sy, allow_start_outside=allow_start_outside):
+                self._log(f"[arc_clear] slip blocked (s={s:.2f} cm)")
+                return False
+
+        # Now check the arc starting from (sx,sy)
         R = float(config.car.turning_radius)
         infl = self._inflation()
         rects = [self._rect_infl(o, infl) for o in self.obstacles]
         dpsi = rad(angle_deg) * (1 if turn_dir.upper() == 'L' else -1)
 
         if turn_dir.upper() == 'L':
-            cx = x - R * math.sin(th); cy = y + R * math.cos(th)
-            a0 = math.atan2(y - cy, x - cx); a1 = a0 + dpsi
+            cx = sx - R * math.sin(th); cy = sy + R * math.cos(th)
+            a0 = math.atan2(sy - cy, sx - cx); a1 = a0 + dpsi
             if a1 <= a0: a1 += 2*math.pi
             length = R * (a1 - a0)
             n = max(3, int(length/2.5))
             for k in range(n+1):
                 a = a0 + (a1 - a0) * (k/n)
-                sx = cx + R * math.cos(a); sy = cy + R * math.sin(a)
+                px = cx + R * math.cos(a); py = cy + R * math.sin(a)
                 if k == 0 and allow_start_outside:
                     continue
-                if not self._inside_walls(sx, sy):
-                    self._log(f"[arc_clear L] OOB at ({sx:.2f},{sy:.2f})")
+                if not self._inside_walls(px, py):
+                    self._log(f"[arc_clear L] OOB at ({px:.2f},{py:.2f})")
                     return False
                 for r in rects:
-                    if self._pt_in_rect(sx, sy, r):
-                        self._log(f"[arc_clear L] obstacle hit at ({sx:.2f},{sy:.2f}) in rect {r}")
+                    if self._pt_in_rect(px, py, r):
+                        self._log(f"[arc_clear L] obstacle hit at ({px:.2f},{py:.2f}) in rect {r}")
                         return False
         else:
-            cx = x + R * math.sin(th); cy = y - R * math.cos(th)
-            a0 = math.atan2(y - cy, x - cx); a1 = a0 + dpsi
+            cx = sx + R * math.sin(th); cy = sy - R * math.cos(th)
+            a0 = math.atan2(sy - cy, sx - cx); a1 = a0 + dpsi
             if a0 <= a1: a0 += 2*math.pi
             length = R * (a0 - a1)
             n = max(3, int(length/2.5))
             for k in range(n+1):
                 a = a0 - (a0 - a1) * (k/n)
-                sx = cx + R * math.cos(a); sy = cy + R * math.sin(a)
+                px = cx + R * math.cos(a); py = cy + R * math.sin(a)
                 if k == 0 and allow_start_outside:
                     continue
-                if not self._inside_walls(sx, sy):
-                    self._log(f"[arc_clear R] OOB at ({sx:.2f},{sy:.2f})")
+                if not self._inside_walls(px, py):
+                    self._log(f"[arc_clear R] OOB at ({px:.2f},{py:.2f})")
                     return False
                 for r in rects:
-                    if self._pt_in_rect(sx, sy, r):
-                        self._log(f"[arc_clear R] obstacle hit at ({sx:.2f},{sy:.2f}) in rect {r}")
+                    if self._pt_in_rect(px, py, r):
+                        self._log(f"[arc_clear R] obstacle hit at ({px:.2f},{py:.2f}) in rect {r}")
                         return False
         return True
 
@@ -220,7 +277,7 @@ class CarPathPlanner:
             else:
                 break
 
-        # ARCS
+        # ARCS (with slip)
         for turn_dir in ("L","R"):
             for ang in (45, 90):  # smaller overshoot first
                 if self._arc_clear(x, y, th, turn_dir, ang, allow_start_outside=allow_start_outside):
@@ -250,8 +307,9 @@ class CarPathPlanner:
             return t
         else:
             _, _turn_dir, ang, _ = action
-            s = float(config.car.turning_radius) * rad(ang)
-            base = s / v_arc
+            s_slip = self._turn_slip(float(ang))
+            s_arc = float(config.car.turning_radius) * rad(ang)
+            base = (s_slip / v_lin) + (s_arc / v_arc)
             per45 = int(round(ang / 45))
             return base + TURN_EPS * per45
 
@@ -323,7 +381,7 @@ class CarPathPlanner:
             if expansions % self._expand_log_every == 0:
                 self._log(f"[A*] expansions={expansions}, open={len(openh)}, g={g:.3f}, f={f:.3f}")
 
-            # ---- tolerant goal test (epsilon in config) ----
+            # tolerant goal test
             if (math.hypot(x - goal.x, y - goal.y) <= pos_tol) and (self._angdiff(th, goal.theta) <= head_tol_rad):
                 actions = self._reconstruct(came, key)
                 return actions, (x, y, th)
@@ -348,7 +406,7 @@ class CarPathPlanner:
 
     # --------------------- Orders ---------------------
     def _compress_orders(self, actions: List[tuple], start_pose: CarState) -> Tuple[List[Dict], CarState]:
-        """Merge consecutive F or B with same heading; emit arc orders as-is."""
+        """Merge consecutive F or B with same heading; emit arc orders as-is (with slip value)."""
         orders: List[Dict] = []
         x, y, th = start_pose.x, start_pose.y, start_pose.theta
 
@@ -382,14 +440,16 @@ class CarPathPlanner:
                     run_kind = want
                     run_dist = d_cm
             else:
-                # arc: end any straight run, then emit arc order
+                # arc (with slip embedded in the end pose)
                 flush()
                 _, turn_dir, ang, cont = a
                 nx, ny, nth = cont
+                slip = self._turn_slip(float(ang))
                 orders.append({
                     "op": "L" if turn_dir == "L" else "R",
                     "angle_deg": int(ang),
                     "radius_cm": float(config.car.turning_radius),
+                    "pre_slip_cm": round(slip, 2),
                     "pose": {"x": round(nx,2), "y": round(ny,2),
                              "theta": round(nth,4), "theta_deg": round(deg(nth),1)}
                 })
@@ -400,9 +460,6 @@ class CarPathPlanner:
 
     # --------------------- Public API ---------------------
     def plan_orders_between(self, start: CarState, goal: CarState) -> List[Dict]:
-        """
-        Plan from start pose to goal pose using lattice A* and return merged orders.
-        """
         self._log(
             f"[plan_between] start=({start.x:.2f},{start.y:.2f},{deg(start.theta):.1f}°) "
             f"goal=({goal.x:.2f},{goal.y:.2f},{deg(goal.theta):.1f}°) "
@@ -429,18 +486,16 @@ class CarPathPlanner:
         cell = max(self.res_cm, float(getattr(config.arena, "grid_cell_size", self.res_cm)))
         infl = self._inflation()
 
-        # --- read camera distance robustly (car or vision), no silent shrink ---
+        # camera distance (car or vision), scaled if desired
         cam_dist = (
             getattr(getattr(config, "car", object()), "camera_distance", None)
             or getattr(getattr(config, "vision", object()), "camera_distance", None)
             or getattr(getattr(config, "vision", object()), "camera_distance_cm", None)
             or 30.0
         )
-        # optional scale knob (default 1.0)
         scale = float(getattr(getattr(config, "planner", object()), "scan_distance_scale", 1.0))
         d_nominal = float(cam_dist) * scale
 
-        # keep-out so the car doesn’t clip the obstacle/wall
         keepout = infl + 0.51 * cell
         d = max(d_nominal, keepout)
 
@@ -460,22 +515,17 @@ class CarPathPlanner:
         while (not self._inside_walls(x, y)) or any(self._pt_in_rect(x, y, self._rect_infl(o, infl)) for o in self.obstacles):
             if tries > 20:
                 return None
-                #raise ValueError("scan pose not clear after nudging")
             if side == 'S':      y -= step
             elif side == 'N':    y += step
             elif side == 'E':    x += step
             else:                x -= step
             tries += 1
 
-        # helpful debug: see what distance was used
         self._log(f"[scan_pose] side={side} cam={cam_dist}cm scale={scale} -> d={d:.1f}cm keepout={keepout:.1f}cm")
         return CarState(x, y, th)
 
-
     def plan_visiting_orders_discrete(self, start_state: CarState, obstacle_indices: List[int]) -> List[Dict]:
-        """
-        Visit a list of obstacle indices in order, outputting F/B/L/R/S with merged straights.
-        """
+        """Visit obstacles in the given order; emits S (scan) between legs."""
         orders_out: List[Dict] = []
         scan_sec = float(getattr(config.vision, "scan_seconds", 0.0))
         cur = start_state
@@ -484,7 +534,8 @@ class CarPathPlanner:
             if not (0 <= idx < len(self.obstacles)):
                 continue
             goal = self.get_image_target_position(self.obstacles[idx])
-            if (goal is None):
+            if goal is None:
+                print("Cannot")
                 continue
             self._log(f"[visit] target#{idx} scan_pose=({goal.x:.2f},{goal.y:.2f},{deg(goal.theta):.1f}°)")
             segment_orders = self.plan_orders_between(cur, goal)
@@ -506,10 +557,7 @@ class CarPathPlanner:
 
 # --------------------- Example quick test ---------------------
 if __name__ == "__main__":
-    # Example: choose grid to match your config scale (arena.size could be 200 or 2000).
     planner = CarPathPlanner(grid_N=2000)
-
-    # Obstacles (size 10 cm in your config)
     planner.add_obstacle(50, 130, 'S')
     planner.add_obstacle(20, 170, 'E')
 
