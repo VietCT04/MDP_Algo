@@ -2,8 +2,8 @@ from dataclasses import dataclass
 
 @dataclass
 class planner:
-    goal_pos_epsilon_cm: float = 2.0
-    goal_heading_epsilon_deg: float = 0.0
+    goal_pos_epsilon_cm: float = 8.0
+    goal_heading_epsilon_deg: float = 15.0
     turn_forward_slip_cm_per_deg = 0.00
 
 @dataclass
@@ -13,8 +13,8 @@ class RobotConfig:
     turning_radius: float = 27
     camera_distance: float = 35.0
     linear_speed_cm_s: float = 10.0
-    angular_speed_rad_s: float = 40.2
-    turn_linear_cm_s: float = 40.2
+    angular_speed_rad_s: float = 10.2
+    turn_linear_cm_s: float = 10.2
     reverse_linear_speed_cm_s: float = 8.0
     image_recognition_time_s: float = 0.0
     forward_motion_error: float = 0.0
@@ -28,7 +28,7 @@ class vision:
 
 @dataclass
 class Arena:
-    size: int = 210
+    size: int = 200
     grid_cell_size: int = 10
     obstacle_size: int = 10
     collision_buffer: int = 3
